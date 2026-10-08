@@ -687,11 +687,11 @@ export default function EditorPage(){
           </div>
         </div>
 
-        <div className="w-full max-w-[860px] relative flex flex-col gap-3">
-          {/* checker peeking sheet */}
-          <div className="absolute -right-2 -bottom-2 w-full h-full rounded-[20px] checker border border-zinc-200 dark:border-white/10 hidden md:block" aria-hidden />
-
-          <div className="relative rounded-[20px] overflow-hidden bg-surface dark:bg-dark-surface border border-zinc-200 dark:border-white/10 shadow-card">
+        <div className="w-full max-w-[860px] flex flex-col gap-3">
+          <div className="relative">
+            {/* checker peeking sheet — only behind preview, never over buttons */}
+            <div className="absolute inset-0 translate-x-2 translate-y-2 rounded-[20px] checker border border-zinc-200 dark:border-white/10 hidden md:block pointer-events-none" aria-hidden />
+            <div className="relative rounded-[20px] overflow-hidden bg-surface dark:bg-dark-surface border border-zinc-200 dark:border-white/10 shadow-card">
 
             {error && (
               <div className="absolute top-3 inset-x-3 z-10 bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/20 text-red-700 dark:text-red-300 text-sm px-3 py-2 rounded-xl flex items-start justify-between gap-2">
@@ -785,9 +785,10 @@ export default function EditorPage(){
               </span>
             </div>
           </div>
+          </div>
 
-          {/* quick actions */}
-          <div className="flex flex-wrap gap-2 justify-center md:justify-start">
+          {/* quick actions — always above sheet */}
+          <div className="flex flex-wrap gap-2 justify-center md:justify-start relative z-10">
             <button onClick={doShare} disabled={!hasResult || processing} className="bg-violet text-white px-5 py-2.5 rounded-full text-sm font-semibold hover:bg-[#5A3FE6] disabled:opacity-50 transition-colors touch-target inline-flex items-center gap-2 shadow-sm">
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 3.5V10.5M8 3.5L5 6M8 3.5L11 6M2.5 10.5V12.5C2.5 12.78 2.72 13 3 13H13C13.28 13 13.5 12.78 13.5 12.5V10.5" stroke="#0F1020" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/></svg>
               Share
@@ -801,15 +802,15 @@ export default function EditorPage(){
         </div>
       </div>
 
-      {/* tools panel — not fixed, flows below preview on mobile so it doesn't cover */}
-      <div className="w-full lg:w-[360px] shrink-0 bg-surface dark:bg-dark-surface border-t lg:border-t-0 lg:border-l border-zinc-200 dark:border-white/10 flex flex-col">
-        <div className="flex items-center justify-between px-4 h-[56px] border-b border-zinc-200 dark:border-white/10">
+      {/* tools panel — desktop: wider, tabs well spaced, content not cramped */}
+      <div className="w-full lg:w-[380px] xl:w-[400px] shrink-0 bg-surface dark:bg-dark-surface border-t lg:border-t-0 lg:border-l border-zinc-200 dark:border-white/10 flex flex-col lg:sticky lg:top-[64px] lg:h-[calc(100vh-64px)] lg:overflow-hidden">
+        <div className="flex items-center justify-between px-4 lg:px-5 h-[56px] border-b border-zinc-200 dark:border-white/10 shrink-0">
           <h2 className="font-heading font-bold">Tools</h2>
           <span className="text-xs bg-violet/10 text-violet px-2.5 py-1 rounded-full font-medium">On-device</span>
         </div>
 
-        {/* tabs */}
-        <div className="px-2 pt-2 pb-1 flex items-center gap-1 overflow-x-auto scrollbar-none border-b border-zinc-200 dark:border-white/10">
+        {/* tabs — desktop: even spacing, wraps on xl without horizontal scroll */}
+        <div className="px-3 lg:px-3 pt-3 pb-2 flex items-center gap-1.5 overflow-x-auto lg:overflow-visible scrollbar-none border-b border-zinc-200 dark:border-white/10 shrink-0 lg:flex-wrap">
           {[
             { id:"remove", label:"Remove" },
             { id:"background", label:"Background" },
@@ -818,13 +819,13 @@ export default function EditorPage(){
             { id:"export", label:"Export" },
           ].map(t=> (
             <button key={t.id} onClick={()=> setTool(t.id as Tool)}
-              className={`px-3.5 py-2 rounded-full text-sm font-medium whitespace-nowrap touch-target transition-colors ${tool===t.id ? "bg-ink text-white dark:bg-white dark:text-ink" : "hover:bg-zinc-50 dark:hover:bg-white/5 text-ink/70 dark:text-white/70"}`}>
+              className={`px-3 lg:px-3.5 py-1.5 lg:py-2 rounded-full text-[13px] lg:text-sm font-medium whitespace-nowrap touch-target transition-colors shrink-0 ${tool===t.id ? "bg-ink text-white dark:bg-white dark:text-ink shadow-sm" : "hover:bg-zinc-50 dark:hover:bg-white/5 text-ink/70 dark:text-white/70 border border-transparent hover:border-zinc-200 dark:hover:border-white/10"}`}>
               {t.label}
             </button>
           ))}
         </div>
 
-        <div className="flex-1 overflow-auto p-4 space-y-5">
+        <div className="flex-1 overflow-auto p-4 lg:p-5 space-y-5 lg:space-y-6">
           {tool==="remove" && (
             <div className="space-y-4">
               <h3 className="font-heading font-bold">Automatic removal</h3>
