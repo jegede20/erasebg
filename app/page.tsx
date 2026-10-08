@@ -9,7 +9,6 @@ import { useState } from "react";
 export default function LandingPage() {
   const router = useRouter();
   const { setCurrent } = useImage();
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [showBefore, setShowBefore] = useState(true);
 
   const handleFile = (file: File) => {
@@ -20,15 +19,6 @@ export default function LandingPage() {
 
   const demoBefore = "/demo-before.jpg";
   const demoAfter = "/demo-after.png";
-  const samples = ["/sample1-before.jpg", "/sample2-before.jpg"];
-
-  const afterMap: Record<string, string> = {
-    "/demo-before.jpg": "/demo-after.png",
-    "/sample1-before.jpg": "/sample1-after.png",
-    "/sample2-before.jpg": "/sample2-after.png",
-  };
-  const activeBefore = previewUrl || demoBefore;
-  const activeAfter = previewUrl ? (afterMap[previewUrl] || previewUrl) : demoAfter;
 
   return (
     <div className="flex-1 flex flex-col dot-grid">
@@ -72,19 +62,7 @@ export default function LandingPage() {
           </div>
 
           <div className="lg:sticky lg:top-[84px]">
-            <CheckerPreview beforeUrl={activeBefore} afterUrl={activeAfter} showBefore={showBefore} onToggle={setShowBefore} />
-            {/* sample picker */}
-            <div className="mt-4 flex items-center gap-2.5" suppressHydrationWarning>
-              <span className="text-xs font-medium text-ink/60 dark:text-white/60">Try a sample:</span>
-              <div className="flex items-center gap-2" suppressHydrationWarning>
-                {samples.map((src,i)=> (
-                  <button key={i} onClick={()=> { setPreviewUrl(src); setShowBefore(false); }} className={`w-10 h-10 rounded-full overflow-hidden border-2 shadow-sm hover:scale-105 transition-transform touch-target ${previewUrl===src ? "border-violet" : "border-white dark:border-dark-surface"}`} aria-label={`Load sample ${i+1}`} suppressHydrationWarning>
-                    <img src={src} alt="" className="w-full h-full object-cover" />
-                  </button>
-                ))}
-                <button onClick={()=> setPreviewUrl(null)} className="ml-1 text-xs px-2.5 py-1 rounded-full border border-zinc-200 dark:border-white/10 bg-white dark:bg-dark-surface hover:bg-zinc-50 dark:hover:bg-white/5">Reset</button>
-              </div>
-            </div>
+            <CheckerPreview beforeUrl={demoBefore} afterUrl={demoAfter} showBefore={showBefore} onToggle={setShowBefore} />
             <p className="mt-2 text-xs text-ink/50 dark:text-white/50">Tap Before / After to compare. Checker = transparent. Subject fits the box, background is removed inside.</p>
           </div>
         </div>
