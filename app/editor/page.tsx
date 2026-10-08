@@ -662,24 +662,6 @@ export default function EditorPage(){
           <div className="absolute -right-2 -bottom-2 w-full h-full rounded-[20px] checker border border-zinc-200 dark:border-white/10 hidden md:block" aria-hidden />
 
           <div className="relative rounded-[20px] overflow-hidden bg-surface dark:bg-dark-surface border border-zinc-200 dark:border-white/10 shadow-card">
-            {/* processing overlay */}
-            {processing && (
-              <div className="absolute inset-0 z-20 bg-white/80 dark:bg-dark-surface/80 backdrop-blur-sm flex flex-col items-center justify-center p-6 text-center">
-                <div className="w-full max-w-[360px]">
-                  <div className="w-12 h-12 mx-auto rounded-2xl bg-violet flex items-center justify-center animate-pulse">
-                    <svg width="22" height="22" viewBox="0 0 22 22" fill="none"><path d="M11 5V17M5 11H17" stroke="white" strokeWidth="1.7" strokeLinecap="round"/></svg>
-                  </div>
-                  <h3 className="font-heading font-bold mt-4">Removing background…</h3>
-                  <p className="text-sm text-ink/60 dark:text-white/60 mt-1">{progressMsg || "This may take a moment"}</p>
-                  <div className="mt-4 h-2 bg-black/5 dark:bg-white/10 rounded-full overflow-hidden">
-                    <div className="h-full bg-violet transition-all duration-300" style={{width: `${progress}%`}} />
-                  </div>
-                  <p className="text-xs text-ink/50 dark:text-white/50 mt-2">{progress}%</p>
-                  {firstTime && <p className="mt-3 text-xs bg-white dark:bg-dark-surface border border-zinc-200 dark:border-white/10 rounded-xl px-3 py-2 text-ink/70 dark:text-white/70">First time only: downloading BiRefNet lite (~200 MB, cached for offline) — High detail via WebGPU (fp32), fallback to WASM. One-time download.</p>}
-                  <p className="mt-2 text-[11px] text-ink/40 dark:text-white/40">On-device • WebGPU fp32 → WASM fallback • No uploads</p>
-                </div>
-              </div>
-            )}
 
             {error && (
               <div className="absolute top-3 inset-x-3 z-10 bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/20 text-red-700 dark:text-red-300 text-sm px-3 py-2 rounded-xl flex items-start justify-between gap-2">
@@ -689,6 +671,13 @@ export default function EditorPage(){
             )}
 
             <div className="relative w-full h-[420px] md:h-[560px] flex items-center justify-center bg-[#F3F3F7] dark:bg-[#1A1A28] overflow-hidden rounded-[16px]" style={{ background: showRawMask ? "#0F1020" : showBefore ? "#F3F3F7" : "#fff" }}>
+              {/* subtle non-covering progress badge — does NOT blanket editor */}
+              {processing && (
+                <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 bg-ink text-white dark:bg-white dark:text-ink px-4 py-1.5 rounded-full text-xs font-medium flex items-center gap-2 shadow-md max-w-[90%]">
+                  <span className="w-3 h-3 border-2 border-white/30 border-t-white dark:border-ink/30 dark:border-t-ink rounded-full animate-spin shrink-0"/>
+                  <span className="truncate">{progressMsg || "Removing background…"} • {progress}%</span>
+                </div>
+              )}
               {showRawMask && rawMaskUrl ? (
                 <div className="relative w-full h-full flex items-center justify-center bg-[#0F1020] overflow-hidden">
                   <img src={rawMaskUrl} alt="Raw mask before feather" className="w-full h-full object-contain p-2" />
