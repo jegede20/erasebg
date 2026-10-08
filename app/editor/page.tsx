@@ -117,7 +117,7 @@ export default function EditorPage(){
     setFirstTime(isFirstTime());
     try {
       // HARD GUARD: use the ORIGINAL File blob directly, never a preview canvas screenshot
-      // High = BiRefNet lite (onnx-community/BiRefNet_lite, WebGPU fp32 -> WASM fallback), Fast = @imgly isnet_quint8 fallback
+      // High = ormbg (onnx-community/ormbg-ONNX, Apache-2.0, WASM -> WebGPU), Fast = @imgly isnet_quint8 fallback
       // Pipeline: preprocess -> model -> sigmoid -> bilinear resize to ORIGINAL -> alpha on full-res (no threshold/blur)
       const blob: Blob = file;
       let outBlob = await removeBackgroundViaWorker(blob, (pct, msg)=>{
@@ -681,7 +681,7 @@ export default function EditorPage(){
               {showRawMask && rawMaskUrl ? (
                 <div className="relative w-full h-full flex items-center justify-center bg-[#0F1020] overflow-hidden">
                   <img src={rawMaskUrl} alt="Raw mask before feather" className="w-full h-full object-contain p-2" />
-                  <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-white text-ink border border-zinc-200 px-3 py-1.5 rounded-full text-[11px] font-semibold">Raw mask — BiRefNet lite (High) / isnet (Fast) — sigmoid, full-res bilinear, no threshold</div>
+                  <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-white text-ink border border-zinc-200 px-3 py-1.5 rounded-full text-[11px] font-semibold">Raw mask — ormbg (High) / isnet (Fast) — alpha, full-res, no threshold</div>
                   <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-black/70 text-white px-3 py-1 rounded-full text-[10px]">White = keep, Black = remove • Debug: before compositing</div>
                 </div>
               ) : showBefore ? (
@@ -770,15 +770,9 @@ export default function EditorPage(){
         </div>
       </div>
 
-      {/* tools panel */}
-      <div className={`w-full lg:w-[360px] shrink-0 bg-surface dark:bg-dark-surface border-t lg:border-t-0 lg:border-l border-zinc-200 dark:border-white/10 flex flex-col max-lg:fixed max-lg:inset-x-0 max-lg:bottom-[72px] max-lg:max-h-[56vh] max-lg:rounded-t-[20px] max-lg:shadow-floating max-lg:z-30 max-lg:overflow-hidden ${isMobile && !sheetOpen ? "max-lg:translate-y-[calc(100%-48px)]" : ""} transition-transform`}>
-        {/* sheet handle mobile */}
-        <button onClick={()=> setSheetOpen(v=>!v)} className="lg:hidden w-full flex flex-col items-center gap-1 py-2.5 touch-target" aria-label={sheetOpen ? "Collapse tools" : "Expand tools"}>
-          <span className="w-9 h-1 rounded-full bg-black/15 dark:bg-white/15" />
-          <span className="text-xs font-medium text-ink/50 dark:text-white/50">{sheetOpen ? "Tools" : "Show tools"}</span>
-        </button>
-
-        <div className="hidden lg:flex items-center justify-between px-4 h-[56px] border-b border-zinc-200 dark:border-white/10">
+      {/* tools panel — not fixed, flows below preview on mobile so it doesn't cover */}
+      <div className="w-full lg:w-[360px] shrink-0 bg-surface dark:bg-dark-surface border-t lg:border-t-0 lg:border-l border-zinc-200 dark:border-white/10 flex flex-col">
+        <div className="flex items-center justify-between px-4 h-[56px] border-b border-zinc-200 dark:border-white/10">
           <h2 className="font-heading font-bold">Tools</h2>
           <span className="text-xs bg-violet/10 text-violet px-2.5 py-1 rounded-full font-medium">On-device</span>
         </div>
@@ -803,12 +797,12 @@ export default function EditorPage(){
           {tool==="remove" && (
             <div className="space-y-4">
               <h3 className="font-heading font-bold">Automatic removal</h3>
-              <p className="text-sm text-ink/60 dark:text-white/60 leading-relaxed">BiRefNet lite runs in a Web Worker — WebGPU fp32 first, WASM fallback. Full-res original: sigmoid mask → bilinear resize to original size → alpha (no threshold/blur).</p>
+              <p className="text-sm text-ink/60 dark:text-white/60 leading-relaxed">ormbg (IS-Net CNN) runs in a Web Worker — WASM first, WebGPU fallback. Full-res original with alpha (no threshold/blur), covers hands/phones/hair reliably.</p>
               <div className="flex gap-2">
                 <button onClick={()=>setQuality("high")} className={`flex-1 py-2.5 rounded-full text-sm font-semibold border touch-target ${quality==="high" ? "bg-ink text-white dark:bg-white dark:text-ink border-ink dark:border-white" : "border-zinc-200 dark:border-white/10 hover:bg-black/5 dark:hover:bg-white/10"}`}>High detail (default)</button>
                 <button onClick={()=>setQuality("fast")} className={`flex-1 py-2.5 rounded-full text-sm font-semibold border touch-target ${quality==="fast" ? "bg-ink text-white dark:bg-white dark:text-ink border-ink dark:border-white" : "border-zinc-200 dark:border-white/10 hover:bg-black/5 dark:hover:bg-white/10"}`}>Fast</button>
               </div>
-              <p className="text-xs text-ink/50 dark:text-white/50 leading-relaxed">High = <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">onnx-community/BiRefNet_lite</code> (~180–220 MB, MIT, WebGPU/WASM, best for hands/phones/hair/white-on-white) — cached after first download. Fast = <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">isnet_quint8</code> (~40 MB, @imgly, fallback). Auto-fallback to Fast if device cannot run BiRefNet (OOM/WebGPU error).</p>
+              <p className="text-xs text-ink/50 dark:text-white/50 leading-relaxed">High = <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">onnx-community/ormbg-ONNX</code> (~40 MB quantized, Apache-2.0, WASM/WebGPU, best balance for general scenes) — cached after first download. Fast = <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">isnet_quint8</code> (~40 MB, @imgly, fallback). Auto-fallback to Fast if High fails (OOM/WebGPU error).</p>
               {processing ? (
                 <div className="bg-violet/5 dark:bg-violet/10 rounded-2xl p-4 border border-violet/15">
                   <div className="flex items-center justify-between text-xs font-medium mb-2"><span>{progressMsg}</span><span>{progress}%</span></div>
