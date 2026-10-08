@@ -1,7 +1,7 @@
 "use client";
-// Unified: BiRefNet lite (High) + @imgly isnet_quint8 (Fast fallback)
-// - High = onnx-community/BiRefNet_lite (1024 WebGPU) / onnx-community/BiRefNet_512x512-ONNX (512 WASM)
-// - Backend auto: WebGPU else WASM 512 only
+// Unified: isnet (clean cut) primary — no leftover bg, no subject cropping
+// - Fast/Clean = @imgly/background-removal isnet (full) > isnet_fp16 > isnet_quint8 fallback
+// - BiRefNet lite kept as optional High (WebGPU 1024 / WASM 512) but default is isnet for reliability
 // - Real download progress only, inference shows indeterminate spinner
 // - Multi-threaded WASM via COOP/COEP headers, timeout 90s fallback
 
@@ -297,7 +297,8 @@ function createWorker(): Worker {
     async function runImglyFast(blob, progressSend, quality){
       const fn=await loadImgly();
       if(!fn) throw new Error('Fast model unavailable');
-      const modelOrder = quality==='high' ? ['isnet','isnet_fp16','isnet_quint8'] : ['isnet_quint8','isnet_fp16','isnet'];
+      // QUALITY: always try best first — isnet (full) preserves hair/edges without cutting, quint8 is fallback for low RAM
+      const modelOrder = ['isnet','isnet_fp16','isnet_quint8'];
       let lastErr=null, outBlob=null;
       const sizeSteps=[null,2048,1536,1024];
       for(const maxEdge of sizeSteps){

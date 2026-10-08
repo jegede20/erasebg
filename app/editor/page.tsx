@@ -76,7 +76,7 @@ export default function EditorPage(){
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(()=>{
-    try{ console.log('[Editor] Fast-only mode (isnet_quint8 via @imgly), crossOriginIsolated:', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown'); }catch{}
+    try{ console.log('[Editor] Clean-cut mode (isnet via @imgly, full quality), crossOriginIsolated:', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown'); }catch{}
   },[]);
 
   // PIPELINE GUARANTEE: file is ALWAYS the original File/Blob.
@@ -224,13 +224,17 @@ export default function EditorPage(){
   };
 
   // refine setup: init mask canvas when resultUrl ready + store original for restore
+  // Persistent canvases are now always mounted (outside preview conditional) so they survive tool switches
   useEffect(()=>{
     if (!resultUrl || !maskCanvasRef.current || !canvasRef.current) return;
     const img = new Image();
     img.crossOrigin = "anonymous";
     img.onload = () => {
+      if (!canvasRef.current || !maskCanvasRef.current) return;
       const c = canvasRef.current!;
       const m = maskCanvasRef.current!;
+      // avoid re-init if already correct size and has data
+      if (c.width === img.naturalWidth && c.height === img.naturalHeight && originalImageDataRef.current) return;
       c.width = img.naturalWidth;
       c.height = img.naturalHeight;
       m.width = img.naturalWidth;
@@ -238,12 +242,10 @@ export default function EditorPage(){
       const ctx = c.getContext("2d")!;
       ctx.clearRect(0,0,c.width,c.height);
       ctx.drawImage(img,0,0);
-      // backup original cutout for accurate restore (preserves soft alpha edges, no halo)
       try { originalImageDataRef.current = ctx.getImageData(0,0,c.width,c.height); } catch {}
       const mctx = m.getContext("2d")!;
       mctx.clearRect(0,0,m.width,m.height);
       setOrigW(img.naturalWidth); setOrigH(img.naturalHeight); setResizeW(img.naturalWidth); setResizeH(img.naturalHeight);
-      renderComposite();
     };
     img.src = resultUrl;
   }, [resultUrl]);
@@ -404,6 +406,13 @@ export default function EditorPage(){
       img.src = bgImageUrl;
     }
   }, [bgImageUrl, bgType]);
+  // FIX: overlay remounts when switching tools (crop ↔ other) — re-draw so image doesn't disappear
+  useEffect(()=>{
+    if (resultUrl && !showBefore && !showRawMask) {
+      const t = setTimeout(()=> renderComposite(), 40);
+      return ()=> clearTimeout(t);
+    }
+  }, [tool, showBefore, showRawMask, resultUrl]);
 
   // crop preset helpers
   const setCropPreset = (preset: "free"|"1:1"|"4:5"|"16:9"|"passport") => {
@@ -692,6 +701,9 @@ export default function EditorPage(){
             )}
 
             <div className="relative w-full h-[420px] md:h-[560px] flex items-center justify-center bg-[#F3F3F7] dark:bg-[#1A1A28] overflow-hidden rounded-[16px]" style={{ background: showRawMask ? "#0F1020" : showBefore ? "#F3F3F7" : "#fff" }}>
+              {/* PERSISTENT offscreen canvases — keep mounted across tool switches so cutout survives */}
+              <canvas ref={canvasRef} className="hidden" width={1} height={1} aria-hidden />
+              <canvas ref={maskCanvasRef} className="hidden" width={1} height={1} aria-hidden />
               {/* subtle non-covering progress — real download % only, inference shows indeterminate */}
               {processing && (
                 <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 bg-ink text-white dark:bg-white dark:text-ink px-4 py-1.5 rounded-full text-xs font-medium flex items-center gap-2 shadow-md max-w-[90%]">
@@ -703,7 +715,7 @@ export default function EditorPage(){
               {showRawMask && rawMaskUrl ? (
                 <div className="relative w-full h-full flex items-center justify-center bg-[#0F1020] overflow-hidden">
                   <img src={rawMaskUrl} alt="Raw mask before feather" className="w-full h-full object-contain p-2" />
-                  <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-white text-ink border border-zinc-200 px-3 py-1.5 rounded-full text-[11px] font-semibold">Raw mask — ormbg (High) / isnet (Fast) — alpha, full-res, no threshold</div>
+                  <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-white text-ink border border-zinc-200 px-3 py-1.5 rounded-full text-[11px] font-semibold">Raw mask — isnet — alpha, full-res, feathered</div>
                   <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-black/70 text-white px-3 py-1 rounded-full text-[10px]">White = keep, Black = remove • Debug: before compositing</div>
                 </div>
               ) : showBefore ? (
@@ -740,9 +752,6 @@ export default function EditorPage(){
                   </ReactCrop>
                 ) : (
                   <div className="relative w-full h-full flex items-center justify-center max-h-[70vh]">
-                    {/* hidden canvases for logic */}
-                    <canvas ref={canvasRef} className="hidden" />
-                    <canvas ref={maskCanvasRef} className="hidden" />
                     {/* visible overlay */}
                     <canvas
                       ref={overlayRef}
@@ -819,8 +828,8 @@ export default function EditorPage(){
           {tool==="remove" && (
             <div className="space-y-4">
               <h3 className="font-heading font-bold">Automatic removal</h3>
-              <p className="text-sm text-ink/60 dark:text-white/60 leading-relaxed">Runs in a Web Worker — fast & reliable, no hangs. Full-res original with smooth alpha.</p>
-              <p className="text-xs text-ink/50 dark:text-white/50 leading-relaxed bg-violet/5 dark:bg-violet/10 rounded-xl p-3 border border-violet/15">Fast mode: <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">isnet_quint8</code> (~40 MB, @imgly/background-removal, WASM, cached after first load) — works on all phones/PCs, no large BiRefNet download.</p>
+              <p className="text-sm text-ink/60 dark:text-white/60 leading-relaxed">Runs in a Web Worker — clean cut, no hangs. Full-res with feathered alpha.</p>
+              <p className="text-xs text-ink/50 dark:text-white/50 leading-relaxed bg-violet/5 dark:bg-violet/10 rounded-xl p-3 border border-violet/15">Clean model: <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">isnet</code> (~80 MB full / 40 MB quint8 fallback, @imgly, WASM, cached after first load) — best quality, no leftover background, no subject cropping.</p>
               {processing ? (
                 <div className="bg-violet/5 dark:bg-violet/10 rounded-2xl p-4 border border-violet/15">
                   {progressMsg?.includes('Removing background, this can take') ? (
@@ -835,14 +844,14 @@ export default function EditorPage(){
                     </>
                   )}
                   <button onClick={()=> abortRef.current?.abort()} className="mt-3 text-xs px-3 py-1.5 rounded-full border border-zinc-200 dark:border-white/10 bg-white dark:bg-dark-surface hover:bg-zinc-50 text-ink/70 dark:text-white/70">Cancel</button>
-                  {firstTime && <p className="text-xs mt-2 bg-white dark:bg-dark-surface border border-zinc-200 dark:border-white/10 rounded-xl px-2.5 py-2 text-ink/60 dark:text-white/60">First time only: large download (~90–170MB) — Wi-Fi recommended on mobile. Cached for offline after.</p>}
+                  {firstTime && <p className="text-xs mt-2 bg-white dark:bg-dark-surface border border-zinc-200 dark:border-white/10 rounded-xl px-2.5 py-2 text-ink/60 dark:text-white/60">First time only: download ~40–80MB (isnet) — Wi-Fi recommended on mobile. Cached for offline after.</p>}
                 </div>
               ) : hasResult ? (
                 <div className="bg-violet/10 border border-violet/20 rounded-2xl p-4 flex gap-3">
                   <div className="w-8 h-8 rounded-full bg-violet text-white flex items-center justify-center shrink-0">✓</div>
                   <div>
                     <p className="text-sm font-semibold">Background removed</p>
-                    <p className="text-xs text-ink/60 dark:text-white/60 mt-1">WebGPU used when available, WebAssembly fallback otherwise. No data left your device.</p>
+                    <p className="text-xs text-ink/60 dark:text-white/60 mt-1">Clean isnet (WASM) — no leftover background, no cropping. No data left your device.</p>
                     <button onClick={()=> currentFile && currentUrl && startRemoval(currentFile, currentUrl)} className="mt-2 text-xs font-semibold text-violet hover:underline">Run again</button>
                   </div>
                 </div>
