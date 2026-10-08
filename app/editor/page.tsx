@@ -70,25 +70,13 @@ export default function EditorPage(){
 
   const isMobile = useIsMobile();
   const [sheetOpen, setSheetOpen] = useState(true);
-  const [quality, setQuality] = useState<"high"|"fast">("high");
+  const quality: "fast" = "fast";
   const [rawMaskUrl, setRawMaskUrl] = useState<string|null>(null);
   const [showRawMask, setShowRawMask] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
-  // Default to High only when WebGPU available, Fast on phones without it
   useEffect(()=>{
-    try{
-      const hasGPU = typeof navigator !== 'undefined' && !!(navigator as any).gpu;
-      console.log('[Editor] hasWebGPU:', hasGPU, 'crossOriginIsolated:', (typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown'));
-      if(!hasGPU){
-        setQuality("fast");
-        console.log('[Editor] Defaulting to Fast (no WebGPU)');
-      } else {
-        console.log('[Editor] Defaulting to High (WebGPU available)');
-      }
-      // Report crossOriginIsolated for multi-thread check
-      console.log('[Editor] crossOriginIsolated:', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown', 'expected true for multi-thread WASM');
-    }catch{}
+    try{ console.log('[Editor] Fast-only mode (isnet_quint8 via @imgly), crossOriginIsolated:', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown'); }catch{}
   },[]);
 
   // PIPELINE GUARANTEE: file is ALWAYS the original File/Blob.
@@ -831,12 +819,8 @@ export default function EditorPage(){
           {tool==="remove" && (
             <div className="space-y-4">
               <h3 className="font-heading font-bold">Automatic removal</h3>
-              <p className="text-sm text-ink/60 dark:text-white/60 leading-relaxed">BiRefNet lite runs in a Web Worker — auto: WebGPU 1024px fp32, otherwise WASM 512px. Full-res original: sigmoid mask → bilinear resize to original size → alpha (no threshold/blur).</p>
-              <div className="flex gap-2">
-                <button onClick={()=>setQuality("high")} className={`flex-1 py-2.5 rounded-full text-sm font-semibold border touch-target ${quality==="high" ? "bg-ink text-white dark:bg-white dark:text-ink border-ink dark:border-white" : "border-zinc-200 dark:border-white/10 hover:bg-black/5 dark:hover:bg-white/10"}`}>High detail (default)</button>
-                <button onClick={()=>setQuality("fast")} className={`flex-1 py-2.5 rounded-full text-sm font-semibold border touch-target ${quality==="fast" ? "bg-ink text-white dark:bg-white dark:text-ink border-ink dark:border-white" : "border-zinc-200 dark:border-white/10 hover:bg-black/5 dark:hover:bg-white/10"}`}>Fast</button>
-              </div>
-              <p className="text-xs text-ink/50 dark:text-white/50 leading-relaxed">High = <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">onnx-community/BiRefNet_lite</code> (1024px WebGPU ~170MB fp32 / 86MB fp16 • 512px WASM ~90MB • MIT • cached after first load, single % progress) — Wi-Fi recommended on mobile (one-time). Fast = <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">isnet_quint8</code> (~40 MB @imgly fallback). Auto-fallback to Fast if device cannot run BiRefNet.</p>
+              <p className="text-sm text-ink/60 dark:text-white/60 leading-relaxed">Runs in a Web Worker — fast & reliable, no hangs. Full-res original with smooth alpha.</p>
+              <p className="text-xs text-ink/50 dark:text-white/50 leading-relaxed bg-violet/5 dark:bg-violet/10 rounded-xl p-3 border border-violet/15">Fast mode: <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">isnet_quint8</code> (~40 MB, @imgly/background-removal, WASM, cached after first load) — works on all phones/PCs, no large BiRefNet download.</p>
               {processing ? (
                 <div className="bg-violet/5 dark:bg-violet/10 rounded-2xl p-4 border border-violet/15">
                   {progressMsg?.includes('Removing background, this can take') ? (
