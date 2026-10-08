@@ -1,11 +1,11 @@
 "use client";
 // Unified: BiRefNet lite (High) + @imgly isnet_quint8 (Fast fallback)
-// - High = onnx-community/BiRefNet_lite (AutoModel+AutoProcessor), 1024px on WebGPU, 512px on WASM
-// - Backend auto: WebGPU fp32 first (avoid fp16 corruption), else WASM 512px
-// - Pipeline: RawImage -> processor -> model({input_image: pixel_values}) -> output_image.sigmoid -> bilinear resize to ORIGINAL -> alpha
-// - No threshold/erosion/blur
+// - High = onnx-community/BiRefNet_lite (1024 WebGPU) / onnx-community/BiRefNet_512x512-ONNX (512 WASM)
+// - Backend auto: WebGPU else WASM 512 only
+// - Real download progress only, inference shows indeterminate spinner
+// - Multi-threaded WASM via COOP/COEP headers, timeout 90s fallback
 
-export type ProgressCb = (pct: number, msg?: string) => void;
+export type ProgressCb = (pct: number | null, msg?: string) => void;
 export type Quality = "high" | "fast";
 
 let workerInstance: Worker | null = null;
@@ -48,7 +48,6 @@ function createWorker(): Worker {
       const urls=[
         'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.1/+esm',
         'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.0/+esm',
-        'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.1/+esm',
         'https://unpkg.com/@huggingface/transformers@3.7.1/+esm'
       ];
       for(const u of urls){
@@ -59,9 +58,17 @@ function createWorker(): Worker {
               mod.env.allowRemoteModels = true;
               mod.env.allowLocalModels = false;
               mod.env.useBrowserCache = true;
+              const isIsolated = typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : false;
+              console.log('[BiRefNet] crossOriginIsolated:', isIsolated, 'hardwareConcurrency:', (typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : 'unknown'));
               if(mod.env.backends && mod.env.backends.onnx && mod.env.backends.onnx.wasm){
+                // Enable multi-thread + SIMD when isolated
+                if(isIsolated){
+                  mod.env.backends.onnx.wasm.numThreads = Math.min(4, (typeof navigator !== 'undefined' ? navigator.hardwareConcurrency || 4 : 4));
+                  mod.env.backends.onnx.wasm.simd = true;
+                } else {
+                  mod.env.backends.onnx.wasm.numThreads = 1;
+                }
                 mod.env.backends.onnx.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0-dev.20250409-89f8206ba4/dist/';
-                mod.env.backends.onnx.wasm.numThreads = 1;
               }
             }catch{}
             transformersMod=mod;
@@ -74,11 +81,8 @@ function createWorker(): Worker {
 
     function hasWebGPU(){
       try{
-        // WorkerNavigator.gpu or navigator.gpu
         if(typeof navigator !== 'undefined' && navigator.gpu) return true;
         if(typeof self !== 'undefined' && self.navigator && self.navigator.gpu) return true;
-        // Also check env
-        if(transformersMod && transformersMod.env && transformersMod.env.backends && transformersMod.env.backends.onnx && transformersMod.env.backends.onnx.webgpu) return true;
       }catch{}
       return false;
     }
@@ -86,51 +90,51 @@ function createWorker(): Worker {
     async function ensureBiRefNet(progressSend){
       if(birefModel && birefProcessor) return {processor:birefProcessor, model:birefModel, device:birefDevice, dtype:birefDtype, modelId: currentModelId};
       const mod=await loadTransformers();
-      const { env, AutoModel, AutoProcessor } = mod;
-      // Decide modelId based on backend
+      const { AutoModel, AutoProcessor } = mod;
       const useWebGPU = hasWebGPU();
-      // Available ONNX files per model page: onnx-community/BiRefNet_lite-ONNX has onnx/model.onnx (~172MB q8 ~90MB) + onnx/model_fp16.onnx
-      // 512 build is onnx-community/BiRefNet_512x512-ONNX (smaller, WASM-friendly)
-      const candidates = useWebGPU
-        ? [{id:'onnx-community/BiRefNet_lite', label:'BiRefNet_lite 1024 WebGPU'}, {id:'onnx-community/BiRefNet_lite-ONNX', label:'BiRefNet_lite-ONNX 1024 WebGPU'}]
-        : [{id:'onnx-community/BiRefNet_512x512-ONNX', label:'BiRefNet 512 WASM'}, {id:'onnx-community/BiRefNet_lite', label:'BiRefNet_lite 1024 WASM fallback'}];
-      // dtype/device attempts
+      console.log('[BiRefNet] hasWebGPU:', useWebGPU);
+      // NEVER use 1024 on WASM — only 512 on WASM
+      const modelId = useWebGPU ? 'onnx-community/BiRefNet_lite' : 'onnx-community/BiRefNet_512x512-ONNX';
+      const fallbackId = useWebGPU ? 'onnx-community/BiRefNet_lite-ONNX' : null;
       const attempts = useWebGPU
-        ? [{device:'webgpu', dtype:'fp32', label:'WebGPU fp32'}, {device:'webgpu', dtype:'fp16', label:'WebGPU fp16 (check corruption)'}]
-        : [{device:'wasm', dtype:'fp32', label:'WASM fp32 512'}, {device:'wasm', dtype:'q8', label:'WASM q8 512'}, {device:'wasm', dtype:'fp16', label:'WASM fp16'}];
+        ? [{device:'webgpu', dtype:'fp32', label:'WebGPU fp32 1024'}, {device:'webgpu', dtype:'fp16', label:'WebGPU fp16 1024'}]
+        : [{device:'wasm', dtype:'q8', label:'WASM q8 512'}, {device:'wasm', dtype:'fp32', label:'WASM fp32 512'}, {device:'wasm', dtype:'fp16', label:'WASM fp16 512'}];
       let lastErr=null;
-      for(const cand of candidates){
-        for(const att of attempts){
+      for(const att of attempts){
+        const tryIds = fallbackId ? [modelId, fallbackId] : [modelId];
+        for(const id of tryIds){
           try{
+            console.time('[BiRefNet] load '+id+' '+att.label);
             progressSend(12, 'Loading BiRefNet lite ('+att.label+')…');
             const progress_callback = (data)=>{
               try{
                 if(data.status==='progress' && data.file){
                   const pct=Math.round(data.progress||0);
-                  // single progress number 10-60
                   const single=10+Math.round(pct*0.5);
+                  // Real download progress only
                   progressSend(single, 'Downloading BiRefNet… '+pct+'%');
-                } else if(String(data.status).includes('download')){
-                  progressSend(15, 'Downloading BiRefNet…');
+                  console.log('[BiRefNet] download', data.file, pct+'%');
                 }
               }catch{}
             };
-            const processor=await AutoProcessor.from_pretrained(cand.id, { progress_callback });
-            const model=await AutoModel.from_pretrained(cand.id, {
+            const processor=await AutoProcessor.from_pretrained(id, { progress_callback });
+            const model=await AutoModel.from_pretrained(id, {
               device: att.device,
               dtype: att.dtype,
               progress_callback,
             });
+            console.timeEnd('[BiRefNet] load '+id+' '+att.label);
             birefProcessor=processor;
             birefModel=model;
             birefDevice=att.device;
             birefDtype=att.dtype;
-            currentModelId=cand.id;
-            progressSend(60, 'BiRefNet ready ('+att.label+')');
-            return {processor, model, device: att.device, dtype: att.dtype, modelId: cand.id};
+            currentModelId=id;
+            // During inference we will show indeterminate spinner, not fake %
+            progressSend(null, 'Removing background, this can take up to a minute on phones');
+            return {processor, model, device: att.device, dtype: att.dtype, modelId: id};
           }catch(e){
             lastErr=e;
-            // if fp16 corrupted, next attempt is fp32 already tried first, so continue
+            console.warn('[BiRefNet] failed', id, att.label, e?.message||e);
             continue;
           }
         }
@@ -155,26 +159,17 @@ function createWorker(): Worker {
         return t/(d.length/4) > 0.08;
       }catch{ return false; }
     }
-    async function downscaleBlob(blob, maxEdge){
-      const bmp=await createImageBitmap(blob);
-      const le=Math.max(bmp.width,bmp.height);
-      if(le<=maxEdge){ bmp.close(); return blob; }
-      const s=maxEdge/le, w=Math.round(bmp.width*s), h=Math.round(bmp.height*s);
-      const c=new OffscreenCanvas(w,h);
-      const ctx=c.getContext('2d');
-      ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high';
-      ctx.drawImage(bmp,0,0,w,h);
-      const out=await c.convertToBlob({type:'image/png'});
-      bmp.close();
-      return out;
-    }
 
     async function runBiRefNet(blob, progressSend){
+      const t0=performance.now();
       const mod=await loadTransformers();
       const { RawImage } = mod;
+      console.time('[BiRefNet] ensure');
       const { processor, model, device } = await ensureBiRefNet(progressSend);
+      console.timeEnd('[BiRefNet] ensure');
+      console.log('[BiRefNet] device', device, 'crossOriginIsolated', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown');
       if(await hasTransparency(blob)){
-        progressSend(92,'Preserving transparency…');
+        progressSend(95,'Preserving transparency…');
         const bmp=await createImageBitmap(blob);
         const c=new OffscreenCanvas(bmp.width,bmp.height);
         const ctx=c.getContext('2d'); ctx.drawImage(bmp,0,0);
@@ -182,11 +177,14 @@ function createWorker(): Worker {
         bmp.close();
         return { blob: out, rawMaskBlob: null, device };
       }
-      progressSend(65,'Preprocessing…');
+      const tp0=performance.now();
+      console.time('[BiRefNet] preprocess');
+      progressSend(null,'Removing background, this can take up to a minute on phones');
       const image=await RawImage.fromBlob(blob);
       const origW=image.width, origH=image.height;
       const fullBmp=await createImageBitmap(blob);
       const fullW=fullBmp.width, fullH=fullBmp.height;
+      // On WASM we already use 512 model, so input is limited to 512 naturally via processor
       let pixel_values;
       try{
         const out=await processor(image);
@@ -194,7 +192,13 @@ function createWorker(): Worker {
         if(!pixel_values && out && out.data) pixel_values=out;
       }catch(e){ throw new Error('Preprocess failed: '+(e?.message||e)); }
       if(!pixel_values) throw new Error('Processor returned no pixel_values');
-      progressSend(74,'Running BiRefNet…');
+      console.timeEnd('[BiRefNet] preprocess');
+      console.log('[BiRefNet] preprocess', Math.round(performance.now()-tp0)+'ms', 'input', pixel_values.dims || pixel_values.shape, 'orig', origW+'x'+origH);
+
+      const ti0=performance.now();
+      console.time('[BiRefNet] inference');
+      // Indeterminate spinner during inference
+      progressSend(null,'Removing background, this can take up to a minute on phones');
       let outputs;
       try{
         try{
@@ -205,7 +209,12 @@ function createWorker(): Worker {
           }
         }
       }catch(e){ throw new Error('Inference failed: '+(e?.message||e)); }
-      progressSend(86,'Processing mask…');
+      console.timeEnd('[BiRefNet] inference');
+      console.log('[BiRefNet] inference', Math.round(performance.now()-ti0)+'ms');
+
+      const tp1=performance.now();
+      console.time('[BiRefNet] postprocess');
+      progressSend(null,'Removing background, this can take up to a minute on phones');
       let tensor=outputs?.output_image || outputs?.logits || outputs?.pred_masks || outputs?.output || outputs?.[0];
       if(!tensor){
         for(const k of Object.keys(outputs||{})){
@@ -224,7 +233,6 @@ function createWorker(): Worker {
       if(flat.length > h*w){
         flat=flat.slice(flat.length - h*w);
       }
-      // Check for fp16 corruption: if many NaN or all same, treat as corrupted and retry with fp32 (handled by outer fallback)
       let corrupted=false;
       if(device==='webgpu'){
         let nanCount=0;
@@ -267,7 +275,23 @@ function createWorker(): Worker {
       octx.putImageData(outData,0,0);
       const outBlob=await outCanvas.convertToBlob({type:'image/png'});
       const rawMaskBlob=await fullMaskCanvas.convertToBlob({type:'image/png'});
+      console.timeEnd('[BiRefNet] postprocess');
+      console.log('[BiRefNet] postprocess', Math.round(performance.now()-tp1)+'ms', 'total', Math.round(performance.now()-t0)+'ms');
       return { blob: outBlob, rawMaskBlob, device, modelId: currentModelId };
+    }
+
+    async function downscaleBlob(blob, maxEdge){
+      const bmp=await createImageBitmap(blob);
+      const le=Math.max(bmp.width,bmp.height);
+      if(le<=maxEdge){ bmp.close(); return blob; }
+      const s=maxEdge/le, w=Math.round(bmp.width*s), h=Math.round(bmp.height*s);
+      const c=new OffscreenCanvas(w,h);
+      const ctx=c.getContext('2d');
+      ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high';
+      ctx.drawImage(bmp,0,0,w,h);
+      const out=await c.convertToBlob({type:'image/png'});
+      bmp.close();
+      return out;
     }
 
     async function runImglyFast(blob, progressSend, quality){
@@ -282,22 +306,18 @@ function createWorker(): Worker {
           try{ input=await downscaleBlob(blob, maxEdge); progressSend(18,'Retrying at '+maxEdge+'px…'); }catch{}
         }
         for(const model of modelOrder){
-          let progInterval;
           try{
-            let lastPct=18;
-            progInterval=setInterval(()=>{ lastPct=Math.min(85,lastPct+1.2); progressSend(lastPct,'Segmenting ('+model+')…'); },600);
             const res=await fn(input,{
               model,
               output:{format:'image/png', quality:0.92},
               progress:(k,c,t)=>{
                 const pct=20+Math.round(c/t*60);
-                const msg=String(k).toLowerCase().includes('model')||String(k).toLowerCase().includes('fetch')||String(k).toLowerCase().includes('download')
+                const msg=String(k).toLowerCase().includes('model')
                   ? 'Downloading '+model+'…'
-                  : 'Segmenting ('+model+')…';
+                  : 'Segmenting…';
                 progressSend(pct, msg);
               }
             });
-            clearInterval(progInterval);
             let b=res instanceof Blob?res:new Blob([res],{type:'image/png'});
             if(!b || b.size<2000) throw new Error('Empty result');
             try{
@@ -311,17 +331,15 @@ function createWorker(): Worker {
             }catch(ve){ if(String(ve.message).includes('No transparency')) throw ve; }
             outBlob=b; lastErr=null; break;
           }catch(err){
-            if(progInterval) clearInterval(progInterval);
             const msg=err?.message||String(err);
             if(isOOM(err)){ progressSend(55,'Out of memory at '+(maxEdge||'full-res')+', retrying smaller…'); lastErr=err; break; }
             if(String(msg).includes('No transparency')){ lastErr=err; break; }
-            lastErr=err; progressSend(60,model+' failed, trying next…'); continue;
+            lastErr=err; continue;
           }
         }
         if(outBlob) break;
       }
       if(!outBlob) throw lastErr||new Error('All Fast models failed');
-      progressSend(92,'Finalizing…');
       return { blob: outBlob, rawMaskBlob: null };
     }
 
@@ -333,7 +351,7 @@ function createWorker(): Worker {
         if(!(blob instanceof Blob) || blob.size===0) throw new Error('Invalid image');
         send({type:'progress', pct:5, msg:'Preparing image…'});
         if(await hasTransparency(blob)){
-          send({type:'progress', pct:92, msg:'Preserving transparency…'});
+          send({type:'progress', pct:95, msg:'Preserving transparency…'});
           try{
             const bmp=await createImageBitmap(blob);
             const c=new OffscreenCanvas(bmp.width,bmp.height);
@@ -345,24 +363,28 @@ function createWorker(): Worker {
         if(q==='high'){
           try{
             send({type:'progress', pct:10, msg:'Loading BiRefNet lite…'});
-            const res=await runBiRefNet(blob, (pct,msg)=> send({type:'progress', pct, msg}));
-            send({type:'progress', pct:94, msg:'Finalizing…'});
+            // Add 90s timeout for whole BiRefNet path
+            const timeoutPromise=new Promise((_,rej)=> setTimeout(()=> rej(new Error('Timeout after 90s')), 90000));
+            const res=await Promise.race([runBiRefNet(blob, (pct,msg)=> send({type:'progress', pct, msg})), timeoutPromise]);
+            send({type:'progress', pct:95, msg:'Finalizing…'});
             send({type:'done', blob:res.blob, rawMaskBlob:res.rawMaskBlob, device: res.device, modelId: res.modelId});
             return;
           }catch(err){
             const msg=err?.message||String(err);
-            if(isOOM(err)){
-              send({type:'progress', pct:50, msg:'BiRefNet out of memory, falling back to Fast…'});
+            const isTimeout=msg.includes('Timeout');
+            if(isOOM(err) || isTimeout){
+              send({type:'progress', pct:50, msg: (isTimeout?'Timed out after 90s, ':'') + 'Falling back to Fast…'});
             }else{
-              send({type:'progress', pct:50, msg:'BiRefNet failed ('+msg.slice(0,60)+'), fallback to Fast…'});
+              send({type:'progress', pct:50, msg:'BiRefNet failed, fallback to Fast…'});
             }
+            console.warn('[BiRefNet] fallback to Fast due to', msg);
             try{
               const res2=await runImglyFast(blob, (pct,m)=> send({type:'progress', pct, msg:m}), 'fast');
-              send({type:'progress', pct:94, msg:'Fallback done (Fast)'});
+              send({type:'progress', pct:95, msg:'Fallback done (Fast)'});
               send({type:'done', blob:res2.blob, rawMaskBlob:null, fallback:true, fallbackReason: msg});
               return;
             }catch(e2){
-              throw new Error('High (BiRefNet) failed: '+msg+' | Fast also failed: '+(e2?.message||e2));
+              throw new Error('High failed: '+msg+' | Fast also failed: '+(e2?.message||e2));
             }
           }
         }else{
@@ -420,7 +442,7 @@ export async function removeBackgroundViaWorker(
     const id=Math.random().toString(36).slice(2);
     const onMessage=(e:MessageEvent)=>{
       if(e.data.id!==id) return;
-      if(e.data.type==="progress") onProgress(Math.round(e.data.pct), e.data.msg);
+      if(e.data.type==="progress") onProgress(e.data.pct as number | null, e.data.msg);
       else if(e.data.type==="done"){
         cleanup();
         if(e.data.rawMaskBlob){
@@ -428,7 +450,7 @@ export async function removeBackgroundViaWorker(
           try{ window.dispatchEvent(new CustomEvent('erasebg-rawmask', {detail:e.data.rawMaskBlob})); }catch{}
         }
         if(e.data.fallback){
-          try{ onProgress(88, "Used Fast fallback — High failed on this device"); }catch{}
+          try{ onProgress(null, "Used Fast fallback — High failed on this device"); }catch{}
         }
         resolve(e.data.blob as Blob);
       }

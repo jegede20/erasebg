@@ -73,6 +73,23 @@ export default function EditorPage(){
   const [quality, setQuality] = useState<"high"|"fast">("high");
   const [rawMaskUrl, setRawMaskUrl] = useState<string|null>(null);
   const [showRawMask, setShowRawMask] = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Default to High only when WebGPU available, Fast on phones without it
+  useEffect(()=>{
+    try{
+      const hasGPU = typeof navigator !== 'undefined' && !!(navigator as any).gpu;
+      console.log('[Editor] hasWebGPU:', hasGPU, 'crossOriginIsolated:', (typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown'));
+      if(!hasGPU){
+        setQuality("fast");
+        console.log('[Editor] Defaulting to Fast (no WebGPU)');
+      } else {
+        console.log('[Editor] Defaulting to High (WebGPU available)');
+      }
+      // Report crossOriginIsolated for multi-thread check
+      console.log('[Editor] crossOriginIsolated:', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown', 'expected true for multi-thread WASM');
+    }catch{}
+  },[]);
 
   // PIPELINE GUARANTEE: file is ALWAYS the original File/Blob.
   // The checker preview (div.checker + overlayRef/canvasRef + p-5 container) is display ONLY.
@@ -115,16 +132,24 @@ export default function EditorPage(){
     setProgress(0);
     setProgressMsg("Preparing…");
     setFirstTime(isFirstTime());
+    const tStart=performance.now();
+    console.log('[Editor] startRemoval', file.name, file.size, 'quality', quality, 'crossOriginIsolated', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown');
+    const ac=new AbortController();
+    abortRef.current=ac;
     try {
       // HARD GUARD: use the ORIGINAL File blob directly, never a preview canvas screenshot
-      // High = ormbg (onnx-community/ormbg-ONNX, Apache-2.0, WASM -> WebGPU), Fast = @imgly isnet_quint8 fallback
-      // Pipeline: preprocess -> model -> sigmoid -> bilinear resize to ORIGINAL -> alpha on full-res (no threshold/blur)
+      // High = BiRefNet lite (1024 WebGPU / 512 WASM auto), Fast = @imgly isnet_quint8 fallback
+      // Pipeline: preprocess -> model -> sigmoid -> bilinear resize to ORIGINAL -> alpha (no threshold/blur)
       const blob: Blob = file;
       let outBlob = await removeBackgroundViaWorker(blob, (pct, msg)=>{
-        setProgress(pct);
+        // Real download progress only: pct is number during download, null during inference (indeterminate)
+        if(pct !== null && typeof pct === 'number') setProgress(pct);
         if (msg) setProgressMsg(msg);
-        if (pct > 30) markModelCached();
-      }, undefined, quality);
+        if (pct !== null && pct > 30) markModelCached();
+        // Log stages
+        if(msg) console.log('[Editor] progress', pct, msg);
+      }, ac.signal, quality);
+      console.log('[Editor] done total', Math.round(performance.now()-tStart)+'ms');
       // Capture RAW mask (before compositing) for debug view — prefer worker-provided rawMask (BiRefNet grayscale full-res)
       try {
         if (rawMaskUrl && rawMaskUrl.startsWith("blob:")) try{ URL.revokeObjectURL(rawMaskUrl); }catch{}
@@ -167,9 +192,17 @@ export default function EditorPage(){
       setShowBefore(false);
       setTool("background");
     } catch(e:any){
-      setError(e.message || "Failed to remove background. Try a smaller image or check WebGPU support — falling back to lightweight mode.");
+      if(e?.name==='AbortError'){
+        setError("Cancelled");
+      } else {
+        console.error('[Editor] failed', e);
+        // Auto fallback is handled in worker; if still fails show message and suggest Fast
+        setError(e.message || "Failed to remove background. Try Fast mode or a smaller image.");
+      }
     } finally {
       setProcessing(false);
+      abortRef.current=null;
+      console.log('[Editor] end total', Math.round(performance.now()-tStart)+'ms');
     }
   }, [setResult, quality]);
 
@@ -671,11 +704,12 @@ export default function EditorPage(){
             )}
 
             <div className="relative w-full h-[420px] md:h-[560px] flex items-center justify-center bg-[#F3F3F7] dark:bg-[#1A1A28] overflow-hidden rounded-[16px]" style={{ background: showRawMask ? "#0F1020" : showBefore ? "#F3F3F7" : "#fff" }}>
-              {/* subtle non-covering progress badge — does NOT blanket editor */}
+              {/* subtle non-covering progress — real download % only, inference shows indeterminate */}
               {processing && (
                 <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 bg-ink text-white dark:bg-white dark:text-ink px-4 py-1.5 rounded-full text-xs font-medium flex items-center gap-2 shadow-md max-w-[90%]">
                   <span className="w-3 h-3 border-2 border-white/30 border-t-white dark:border-ink/30 dark:border-t-ink rounded-full animate-spin shrink-0"/>
-                  <span className="truncate">{progressMsg?.includes('%') ? progressMsg : `${progressMsg || "Removing background…"} • ${progress}%`}</span>
+                  <span className="truncate">{progressMsg?.includes('Removing background') ? progressMsg : (progressMsg || "Removing background…")}</span>
+                  <button onClick={()=> abortRef.current?.abort()} className="ml-1 px-2 py-0.5 rounded-full bg-white/15 text-white text-[11px] hover:bg-white/25">Cancel</button>
                 </div>
               )}
               {showRawMask && rawMaskUrl ? (
@@ -805,8 +839,18 @@ export default function EditorPage(){
               <p className="text-xs text-ink/50 dark:text-white/50 leading-relaxed">High = <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">onnx-community/BiRefNet_lite</code> (1024px WebGPU ~170MB fp32 / 86MB fp16 • 512px WASM ~90MB • MIT • cached after first load, single % progress) — Wi-Fi recommended on mobile (one-time). Fast = <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">isnet_quint8</code> (~40 MB @imgly fallback). Auto-fallback to Fast if device cannot run BiRefNet.</p>
               {processing ? (
                 <div className="bg-violet/5 dark:bg-violet/10 rounded-2xl p-4 border border-violet/15">
-                  <div className="flex items-center justify-between text-xs font-medium mb-2"><span>{progressMsg}</span><span>{progress}%</span></div>
-                  <div className="h-2 bg-black/5 dark:bg-white/10 rounded-full overflow-hidden"><div className="h-full bg-violet transition-all" style={{width:`${progress}%`}}/></div>
+                  {progressMsg?.includes('Removing background, this can take') ? (
+                    <div className="flex items-center gap-2 text-xs font-medium">
+                      <span className="w-4 h-4 border-2 border-violet/30 border-t-violet rounded-full animate-spin shrink-0"/>
+                      <span>{progressMsg}</span>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="flex items-center justify-between text-xs font-medium mb-2"><span>{progressMsg}</span><span>{progress}%</span></div>
+                      <div className="h-2 bg-black/5 dark:bg-white/10 rounded-full overflow-hidden"><div className="h-full bg-violet transition-all" style={{width:`${progress}%`}}/></div>
+                    </>
+                  )}
+                  <button onClick={()=> abortRef.current?.abort()} className="mt-3 text-xs px-3 py-1.5 rounded-full border border-zinc-200 dark:border-white/10 bg-white dark:bg-dark-surface hover:bg-zinc-50 text-ink/70 dark:text-white/70">Cancel</button>
                   {firstTime && <p className="text-xs mt-2 bg-white dark:bg-dark-surface border border-zinc-200 dark:border-white/10 rounded-xl px-2.5 py-2 text-ink/60 dark:text-white/60">First time only: large download (~90–170MB) — Wi-Fi recommended on mobile. Cached for offline after.</p>}
                 </div>
               ) : hasResult ? (
