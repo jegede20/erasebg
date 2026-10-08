@@ -1,9 +1,9 @@
 "use client";
-// Unified background removal: ormbg (High, Apache-2.0, CNN, reliable) + @imgly (Fast fallback)
-// - High default = onnx-community/ormbg-ONNX via @huggingface/transformers pipeline('background-removal') inside Web Worker
-// - Fast = @imgly/background-removal isnet_quint8
-// - WASM first (reliable), WebGPU fallback, auto-fallback to Fast on failure
-// - Pipeline: RawImage.fromBlob -> segmenter(image) -> RGBA with alpha (no threshold/blur)
+// Unified: BiRefNet lite (High) + @imgly isnet_quint8 (Fast fallback)
+// - High = onnx-community/BiRefNet_lite (AutoModel+AutoProcessor), 1024px on WebGPU, 512px on WASM
+// - Backend auto: WebGPU fp32 first (avoid fp16 corruption), else WASM 512px
+// - Pipeline: RawImage -> processor -> model({input_image: pixel_values}) -> output_image.sigmoid -> bilinear resize to ORIGINAL -> alpha
+// - No threshold/erosion/blur
 
 export type ProgressCb = (pct: number, msg?: string) => void;
 export type Quality = "high" | "fast";
@@ -13,8 +13,11 @@ let workerInstance: Worker | null = null;
 function createWorker(): Worker {
   const code = `
     let transformersMod = null;
-    let segmenter = null;
-    let segmenterDevice = null;
+    let birefProcessor = null;
+    let birefModel = null;
+    let birefDevice = null;
+    let birefDtype = null;
+    let currentModelId = null;
     let removeBackgroundFn = null;
     let loadPromise = null;
 
@@ -51,7 +54,7 @@ function createWorker(): Worker {
       for(const u of urls){
         try{
           const mod=await import(u);
-          if(mod.env && mod.pipeline && mod.RawImage){
+          if(mod.env && mod.AutoModel && mod.AutoProcessor && mod.RawImage){
             try{
               mod.env.allowRemoteModels = true;
               mod.env.allowLocalModels = false;
@@ -69,49 +72,70 @@ function createWorker(): Worker {
       throw new Error('Failed to load transformers');
     }
 
-    async function ensureOrmbg(progressSend){
-      if(segmenter) return segmenter;
+    function hasWebGPU(){
+      try{
+        // WorkerNavigator.gpu or navigator.gpu
+        if(typeof navigator !== 'undefined' && navigator.gpu) return true;
+        if(typeof self !== 'undefined' && self.navigator && self.navigator.gpu) return true;
+        // Also check env
+        if(transformersMod && transformersMod.env && transformersMod.env.backends && transformersMod.env.backends.onnx && transformersMod.env.backends.onnx.webgpu) return true;
+      }catch{}
+      return false;
+    }
+
+    async function ensureBiRefNet(progressSend){
+      if(birefModel && birefProcessor) return {processor:birefProcessor, model:birefModel, device:birefDevice, dtype:birefDtype, modelId: currentModelId};
       const mod=await loadTransformers();
-      const { pipeline } = mod;
-      const modelId='onnx-community/ormbg-ONNX';
-      const progress_callback = (data)=>{
-        try{
-          if(data.status==='progress' && data.file){
-            const pct=Math.round(data.progress||0);
-            progressSend(10+Math.round(pct*0.5), 'Downloading ormbg '+data.file+'… '+pct+'%');
-          } else if(String(data.status).includes('download')){
-            progressSend(15, 'Downloading ormbg…');
-          } else if(data.status==='ready' || data.status==='done'){
-            progressSend(55, 'ormbg cached');
-          }
-        }catch{}
-      };
-      // Try WASM first (most reliable for CNN), then WebGPU
-      const attempts=[
-        {device:'wasm', dtype:'fp32', label:'WASM fp32'},
-        {device:'wasm', dtype:'q8', label:'WASM q8'},
-        {device:'webgpu', dtype:'fp32', label:'WebGPU fp32'},
-        {device:'webgpu', dtype:'fp16', label:'WebGPU fp16'},
-      ];
+      const { env, AutoModel, AutoProcessor } = mod;
+      // Decide modelId based on backend
+      const useWebGPU = hasWebGPU();
+      // Available ONNX files per model page: onnx-community/BiRefNet_lite-ONNX has onnx/model.onnx (~172MB q8 ~90MB) + onnx/model_fp16.onnx
+      // 512 build is onnx-community/BiRefNet_512x512-ONNX (smaller, WASM-friendly)
+      const candidates = useWebGPU
+        ? [{id:'onnx-community/BiRefNet_lite', label:'BiRefNet_lite 1024 WebGPU'}, {id:'onnx-community/BiRefNet_lite-ONNX', label:'BiRefNet_lite-ONNX 1024 WebGPU'}]
+        : [{id:'onnx-community/BiRefNet_512x512-ONNX', label:'BiRefNet 512 WASM'}, {id:'onnx-community/BiRefNet_lite', label:'BiRefNet_lite 1024 WASM fallback'}];
+      // dtype/device attempts
+      const attempts = useWebGPU
+        ? [{device:'webgpu', dtype:'fp32', label:'WebGPU fp32'}, {device:'webgpu', dtype:'fp16', label:'WebGPU fp16 (check corruption)'}]
+        : [{device:'wasm', dtype:'fp32', label:'WASM fp32 512'}, {device:'wasm', dtype:'q8', label:'WASM q8 512'}, {device:'wasm', dtype:'fp16', label:'WASM fp16'}];
       let lastErr=null;
-      for(const att of attempts){
-        try{
-          progressSend(12, 'Loading ormbg ('+att.label+')…');
-          const seg=await pipeline('background-removal', modelId, {
-            device: att.device,
-            dtype: att.dtype,
-            progress_callback,
-          });
-          segmenter=seg;
-          segmenterDevice=att.device;
-          progressSend(60, 'ormbg ready ('+att.label+')');
-          return seg;
-        }catch(e){
-          lastErr=e;
-          progressSend(20, att.label+' not available, trying fallback…');
+      for(const cand of candidates){
+        for(const att of attempts){
+          try{
+            progressSend(12, 'Loading BiRefNet lite ('+att.label+')…');
+            const progress_callback = (data)=>{
+              try{
+                if(data.status==='progress' && data.file){
+                  const pct=Math.round(data.progress||0);
+                  // single progress number 10-60
+                  const single=10+Math.round(pct*0.5);
+                  progressSend(single, 'Downloading BiRefNet… '+pct+'%');
+                } else if(String(data.status).includes('download')){
+                  progressSend(15, 'Downloading BiRefNet…');
+                }
+              }catch{}
+            };
+            const processor=await AutoProcessor.from_pretrained(cand.id, { progress_callback });
+            const model=await AutoModel.from_pretrained(cand.id, {
+              device: att.device,
+              dtype: att.dtype,
+              progress_callback,
+            });
+            birefProcessor=processor;
+            birefModel=model;
+            birefDevice=att.device;
+            birefDtype=att.dtype;
+            currentModelId=cand.id;
+            progressSend(60, 'BiRefNet ready ('+att.label+')');
+            return {processor, model, device: att.device, dtype: att.dtype, modelId: cand.id};
+          }catch(e){
+            lastErr=e;
+            // if fp16 corrupted, next attempt is fp32 already tried first, so continue
+            continue;
+          }
         }
       }
-      throw lastErr||new Error('ormbg failed to load');
+      throw lastErr||new Error('BiRefNet lite failed to load');
     }
 
     function isOOM(err){
@@ -145,10 +169,10 @@ function createWorker(): Worker {
       return out;
     }
 
-    async function runOrmbg(blob, progressSend){
+    async function runBiRefNet(blob, progressSend){
       const mod=await loadTransformers();
       const { RawImage } = mod;
-      const seg=await ensureOrmbg(progressSend);
+      const { processor, model, device } = await ensureBiRefNet(progressSend);
       if(await hasTransparency(blob)){
         progressSend(92,'Preserving transparency…');
         const bmp=await createImageBitmap(blob);
@@ -156,56 +180,99 @@ function createWorker(): Worker {
         const ctx=c.getContext('2d'); ctx.drawImage(bmp,0,0);
         const out=await c.convertToBlob({type:'image/png'});
         bmp.close();
-        return { blob: out, rawMaskBlob: null, device: segmenterDevice };
+        return { blob: out, rawMaskBlob: null, device };
       }
       progressSend(65,'Preprocessing…');
       const image=await RawImage.fromBlob(blob);
-      progressSend(72,'Running ormbg…');
+      const origW=image.width, origH=image.height;
+      const fullBmp=await createImageBitmap(blob);
+      const fullW=fullBmp.width, fullH=fullBmp.height;
+      let pixel_values;
+      try{
+        const out=await processor(image);
+        pixel_values=out.pixel_values || out.input_image || out[Object.keys(out)[0]];
+        if(!pixel_values && out && out.data) pixel_values=out;
+      }catch(e){ throw new Error('Preprocess failed: '+(e?.message||e)); }
+      if(!pixel_values) throw new Error('Processor returned no pixel_values');
+      progressSend(74,'Running BiRefNet…');
       let outputs;
       try{
-        outputs=await seg(image);
-      }catch(e){
-        throw new Error('Model inference failed: '+(e?.message||e));
+        try{
+          outputs=await model({ input_image: pixel_values });
+        }catch(e1){
+          try{ outputs=await model({ pixel_values }); }catch(e2){
+            outputs=await model(pixel_values);
+          }
+        }
+      }catch(e){ throw new Error('Inference failed: '+(e?.message||e)); }
+      progressSend(86,'Processing mask…');
+      let tensor=outputs?.output_image || outputs?.logits || outputs?.pred_masks || outputs?.output || outputs?.[0];
+      if(!tensor){
+        for(const k of Object.keys(outputs||{})){
+          const v=outputs[k];
+          if(v && v.data && v.dims){ tensor=v; break; }
+          if(v && Array.isArray(v) && v[0] && v[0].data) { tensor=v[0]; break; }
+        }
       }
-      progressSend(84,'Processing mask…');
-      // outputs is RawImage or array
-      let outImage = Array.isArray(outputs) ? outputs[0] : outputs;
-      // Some pipeline returns {image} wrapper?
-      if(outImage && outImage.image) outImage = outImage.image;
-      if(!outImage || !outImage.data || !outImage.width){
-        // Try to handle different return shapes
-        if(outputs && outputs.data && outputs.width) outImage = outputs;
-        else throw new Error('No output image');
+      if(!tensor) throw new Error('No output tensor');
+      if(Array.isArray(tensor)) tensor=tensor[0];
+      const dims=tensor.dims || tensor.shape;
+      if(!dims) throw new Error('Tensor dims missing');
+      const data=tensor.data;
+      let h=dims[dims.length-2], w=dims[dims.length-1];
+      let flat=data;
+      if(flat.length > h*w){
+        flat=flat.slice(flat.length - h*w);
       }
-      // outImage is RawImage with RGBA, already at original size with alpha
-      // Convert to blob via OffscreenCanvas
-      const w=outImage.width, h=outImage.height;
-      const canvas=new OffscreenCanvas(w,h);
-      const ctx=canvas.getContext('2d');
-      const imgData=ctx.createImageData(w,h);
-      // outImage.data is Uint8Array RGBA
-      imgData.data.set(outImage.data);
-      ctx.putImageData(imgData,0,0);
-      const outBlob=await canvas.convertToBlob({type:'image/png'});
-      // Build raw mask for debug (grayscale from alpha)
+      // Check for fp16 corruption: if many NaN or all same, treat as corrupted and retry with fp32 (handled by outer fallback)
+      let corrupted=false;
+      if(device==='webgpu'){
+        let nanCount=0;
+        for(let i=0;i<Math.min(1000, flat.length); i++) if(isNaN(flat[i])) nanCount++;
+        if(nanCount>10) corrupted=true;
+      }
+      if(corrupted) throw new Error('WebGPU fp16 output corrupted, need fp32');
+      const maskU8=new Uint8Array(h*w);
+      for(let i=0;i<h*w;i++){
+        const v=flat[i];
+        const sig=1/(1+Math.exp(-v));
+        maskU8[i]=Math.round(sig*255);
+      }
       const maskCanvas=new OffscreenCanvas(w,h);
       const mctx=maskCanvas.getContext('2d');
-      const maskData=mctx.createImageData(w,h);
-      for(let i=0;i<w*h;i++){
-        const a=outImage.data[i*4+3];
-        maskData.data[i*4]=a;
-        maskData.data[i*4+1]=a;
-        maskData.data[i*4+2]=a;
-        maskData.data[i*4+3]=255;
+      const imgData=mctx.createImageData(w,h);
+      for(let i=0;i<h*w;i++){
+        const v=maskU8[i];
+        imgData.data[i*4]=v;
+        imgData.data[i*4+1]=v;
+        imgData.data[i*4+2]=v;
+        imgData.data[i*4+3]=255;
       }
-      mctx.putImageData(maskData,0,0);
-      const rawMaskBlob=await maskCanvas.convertToBlob({type:'image/png'});
-      return { blob: outBlob, rawMaskBlob, device: segmenterDevice };
+      mctx.putImageData(imgData,0,0);
+      const fullMaskCanvas=new OffscreenCanvas(fullW, fullH);
+      const fctx=fullMaskCanvas.getContext('2d');
+      fctx.imageSmoothingEnabled=true;
+      fctx.imageSmoothingQuality='high';
+      fctx.drawImage(maskCanvas,0,0,w,h,0,0,fullW,fullH);
+      const fullMaskData=fctx.getImageData(0,0,fullW,fullH);
+      const outCanvas=new OffscreenCanvas(fullW, fullH);
+      const octx=outCanvas.getContext('2d');
+      octx.drawImage(fullBmp,0,0);
+      fullBmp.close();
+      const outData=octx.getImageData(0,0,fullW,fullH);
+      for(let i=0;i<fullW*fullH;i++){
+        const maskVal=fullMaskData.data[i*4];
+        outData.data[i*4+3]=maskVal;
+      }
+      octx.putImageData(outData,0,0);
+      const outBlob=await outCanvas.convertToBlob({type:'image/png'});
+      const rawMaskBlob=await fullMaskCanvas.convertToBlob({type:'image/png'});
+      return { blob: outBlob, rawMaskBlob, device, modelId: currentModelId };
     }
 
     async function runImglyFast(blob, progressSend, quality){
       const fn=await loadImgly();
-      if(!fn) throw new Error('Fast model unavailable — check internet for first download (isnet_quint8 ~40 MB, cached offline).');
+      if(!fn) throw new Error('Fast model unavailable');
       const modelOrder = quality==='high' ? ['isnet','isnet_fp16','isnet_quint8'] : ['isnet_quint8','isnet_fp16','isnet'];
       let lastErr=null, outBlob=null;
       const sizeSteps=[null,2048,1536,1024];
@@ -226,7 +293,7 @@ function createWorker(): Worker {
                 const pct=20+Math.round(c/t*60);
                 const msg=String(k).toLowerCase().includes('model')||String(k).toLowerCase().includes('fetch')||String(k).toLowerCase().includes('download')
                   ? 'Downloading '+model+'…'
-                  : 'Segmenting foreground ('+model+')…';
+                  : 'Segmenting ('+model+')…';
                 progressSend(pct, msg);
               }
             });
@@ -277,17 +344,17 @@ function createWorker(): Worker {
         }
         if(q==='high'){
           try{
-            send({type:'progress', pct:10, msg:'Loading ormbg…'});
-            const res=await runOrmbg(blob, (pct,msg)=> send({type:'progress', pct, msg}));
+            send({type:'progress', pct:10, msg:'Loading BiRefNet lite…'});
+            const res=await runBiRefNet(blob, (pct,msg)=> send({type:'progress', pct, msg}));
             send({type:'progress', pct:94, msg:'Finalizing…'});
-            send({type:'done', blob:res.blob, rawMaskBlob:res.rawMaskBlob, device: res.device});
+            send({type:'done', blob:res.blob, rawMaskBlob:res.rawMaskBlob, device: res.device, modelId: res.modelId});
             return;
           }catch(err){
             const msg=err?.message||String(err);
             if(isOOM(err)){
-              send({type:'progress', pct:50, msg:'ormbg out of memory, falling back to Fast…'});
+              send({type:'progress', pct:50, msg:'BiRefNet out of memory, falling back to Fast…'});
             }else{
-              send({type:'progress', pct:50, msg:'ormbg failed ('+msg.slice(0,60)+'), fallback to Fast…'});
+              send({type:'progress', pct:50, msg:'BiRefNet failed ('+msg.slice(0,60)+'), fallback to Fast…'});
             }
             try{
               const res2=await runImglyFast(blob, (pct,m)=> send({type:'progress', pct, msg:m}), 'fast');
@@ -295,7 +362,7 @@ function createWorker(): Worker {
               send({type:'done', blob:res2.blob, rawMaskBlob:null, fallback:true, fallbackReason: msg});
               return;
             }catch(e2){
-              throw new Error('High (ormbg) failed: '+msg+' | Fast fallback also failed: '+(e2?.message||e2));
+              throw new Error('High (BiRefNet) failed: '+msg+' | Fast also failed: '+(e2?.message||e2));
             }
           }
         }else{

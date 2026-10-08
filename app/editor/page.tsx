@@ -675,7 +675,7 @@ export default function EditorPage(){
               {processing && (
                 <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 bg-ink text-white dark:bg-white dark:text-ink px-4 py-1.5 rounded-full text-xs font-medium flex items-center gap-2 shadow-md max-w-[90%]">
                   <span className="w-3 h-3 border-2 border-white/30 border-t-white dark:border-ink/30 dark:border-t-ink rounded-full animate-spin shrink-0"/>
-                  <span className="truncate">{progressMsg || "Removing background…"} • {progress}%</span>
+                  <span className="truncate">{progressMsg?.includes('%') ? progressMsg : `${progressMsg || "Removing background…"} • ${progress}%`}</span>
                 </div>
               )}
               {showRawMask && rawMaskUrl ? (
@@ -702,8 +702,8 @@ export default function EditorPage(){
               ) : (
                 // After view
                 !hasResult ? (
-                  <div className="p-8 text-center">
-                    <p className="text-sm text-ink/50 dark:text-white/50">Processing…</p>
+                  <div className="relative w-full h-full flex items-center justify-center">
+                    <img src={currentUrl!} alt="Original" className="w-full h-full object-contain p-2 opacity-30 blur-[1.5px] scale-[0.98]" />
                   </div>
                 ) : tool==="crop" ? (
                   // crop also applies to result? show crop on result
@@ -797,17 +797,17 @@ export default function EditorPage(){
           {tool==="remove" && (
             <div className="space-y-4">
               <h3 className="font-heading font-bold">Automatic removal</h3>
-              <p className="text-sm text-ink/60 dark:text-white/60 leading-relaxed">ormbg (IS-Net CNN) runs in a Web Worker — WASM first, WebGPU fallback. Full-res original with alpha (no threshold/blur), covers hands/phones/hair reliably.</p>
+              <p className="text-sm text-ink/60 dark:text-white/60 leading-relaxed">BiRefNet lite runs in a Web Worker — auto: WebGPU 1024px fp32, otherwise WASM 512px. Full-res original: sigmoid mask → bilinear resize to original size → alpha (no threshold/blur).</p>
               <div className="flex gap-2">
                 <button onClick={()=>setQuality("high")} className={`flex-1 py-2.5 rounded-full text-sm font-semibold border touch-target ${quality==="high" ? "bg-ink text-white dark:bg-white dark:text-ink border-ink dark:border-white" : "border-zinc-200 dark:border-white/10 hover:bg-black/5 dark:hover:bg-white/10"}`}>High detail (default)</button>
                 <button onClick={()=>setQuality("fast")} className={`flex-1 py-2.5 rounded-full text-sm font-semibold border touch-target ${quality==="fast" ? "bg-ink text-white dark:bg-white dark:text-ink border-ink dark:border-white" : "border-zinc-200 dark:border-white/10 hover:bg-black/5 dark:hover:bg-white/10"}`}>Fast</button>
               </div>
-              <p className="text-xs text-ink/50 dark:text-white/50 leading-relaxed">High = <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">onnx-community/ormbg-ONNX</code> (~40 MB quantized, Apache-2.0, WASM/WebGPU, best balance for general scenes) — cached after first download. Fast = <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">isnet_quint8</code> (~40 MB, @imgly, fallback). Auto-fallback to Fast if High fails (OOM/WebGPU error).</p>
+              <p className="text-xs text-ink/50 dark:text-white/50 leading-relaxed">High = <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">onnx-community/BiRefNet_lite</code> (1024px WebGPU ~170MB fp32 / 86MB fp16 • 512px WASM ~90MB • MIT • cached after first load, single % progress) — Wi-Fi recommended on mobile (one-time). Fast = <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">isnet_quint8</code> (~40 MB @imgly fallback). Auto-fallback to Fast if device cannot run BiRefNet.</p>
               {processing ? (
                 <div className="bg-violet/5 dark:bg-violet/10 rounded-2xl p-4 border border-violet/15">
                   <div className="flex items-center justify-between text-xs font-medium mb-2"><span>{progressMsg}</span><span>{progress}%</span></div>
                   <div className="h-2 bg-black/5 dark:bg-white/10 rounded-full overflow-hidden"><div className="h-full bg-violet transition-all" style={{width:`${progress}%`}}/></div>
-                  {firstTime && <p className="text-xs mt-2 bg-white dark:bg-dark-surface border border-zinc-200 dark:border-white/10 rounded-xl px-2.5 py-2 text-ink/60 dark:text-white/60">First time only: model is downloading and will be cached for offline use.</p>}
+                  {firstTime && <p className="text-xs mt-2 bg-white dark:bg-dark-surface border border-zinc-200 dark:border-white/10 rounded-xl px-2.5 py-2 text-ink/60 dark:text-white/60">First time only: large download (~90–170MB) — Wi-Fi recommended on mobile. Cached for offline after.</p>}
                 </div>
               ) : hasResult ? (
                 <div className="bg-violet/10 border border-violet/20 rounded-2xl p-4 flex gap-3">
