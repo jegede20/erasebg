@@ -293,6 +293,103 @@ function createWorker(): Worker {
       bmp.close();
       return out;
     }
+    // Edge preservation: add transparent padding so subjects at image border aren't clipped, then feather-expand 1-2px to fix flat wrist/bottom cuts
+    async function padBlob(blob, pad){
+      const bmp=await createImageBitmap(blob);
+      const c=new OffscreenCanvas(bmp.width+pad*2, bmp.height+pad*2);
+      const ctx=c.getContext('2d');
+      ctx.clearRect(0,0,c.width,c.height);
+      ctx.drawImage(bmp, pad, pad);
+      const out=await c.convertToBlob({type:'image/png'});
+      const w=bmp.width, h=bmp.height;
+      bmp.close();
+      return {blob:out, w, h, pad};
+    }
+    async function unpadBlob(paddedBlob, pad, origW, origH){
+      const bmp=await createImageBitmap(paddedBlob);
+      const c=new OffscreenCanvas(origW, origH);
+      const ctx=c.getContext('2d');
+      // Handle case where model resized output (should be padded size). Scale then crop.
+      const expectedW = origW + pad*2;
+      const expectedH = origH + pad*2;
+      if(bmp.width===expectedW && bmp.height===expectedH){
+        ctx.drawImage(bmp, -pad, -pad);
+      } else {
+        // Scale to expected padded size then crop
+        const scale = Math.min(bmp.width/expectedW, bmp.height/expectedH);
+        // Draw scaled padded image and offset by pad
+        const drawW = expectedW * scale;
+        const drawH = expectedH * scale;
+        const offX = (bmp.width - drawW)/2;
+        const offY = (bmp.height - drawH)/2;
+        // Extract central orig region
+        ctx.drawImage(bmp, offX + pad*scale, offY + pad*scale, origW*scale, origH*scale, 0, 0, origW, origH);
+      }
+      const out=await c.convertToBlob({type:'image/png'});
+      bmp.close();
+      return out;
+    }
+    async function featherExpandEdge(blob){
+      // Soft 2px dilation to restore flat bottom/wrist cuts — feathered, not hard halo
+      try{
+        const bmp=await createImageBitmap(blob);
+        const c=new OffscreenCanvas(bmp.width, bmp.height);
+        const ctx=c.getContext('2d');
+        ctx.drawImage(bmp,0,0);
+        const img=ctx.getImageData(0,0,c.width,c.height);
+        const d=img.data, w=c.width, h=c.height;
+        const copy=new Uint8Array(d);
+        // 2px radius soft expand: for transparent pixels near opaque, add feathered alpha
+        for(let y=0;y<h;y++){
+          for(let x=0;x<w;x++){
+            const i=(y*w+x)*4;
+            if(d[i+3] > 20) continue; // already opaque/feathered
+            let maxA=0;
+            for(let dy=-2; dy<=2; dy++){
+              for(let dx=-2; dx<=2; dx++){
+                if(dx===0&&dy===0) continue;
+                const nx=x+dx, ny=y+dy;
+                if(nx<0||ny<0||nx>=w||ny>=h) continue;
+                const ni=(ny*w+nx)*4;
+                const a=copy[ni+3];
+                if(a>150){
+                  const dist=Math.sqrt(dx*dx+dy*dy);
+                  const feather = dist<=1 ? 90 : dist<=1.5 ? 55 : 30;
+                  if(feather>maxA) maxA=feather;
+                } else if(a>80){
+                  if(35>maxA) maxA=35;
+                }
+              }
+            }
+            if(maxA>0){
+              // copy color from nearest opaque neighbor
+              let best=null, bestDist=99;
+              for(let dy=-2; dy<=2; dy++){
+                for(let dx=-2; dx<=2; dx++){
+                  const nx=x+dx, ny=y+dy;
+                  if(nx<0||ny<0||nx>=w||ny>=h) continue;
+                  const ni=(ny*w+nx)*4;
+                  if(copy[ni+3]>150){
+                    const dist=Math.abs(dx)+Math.abs(dy);
+                    if(dist<bestDist){ bestDist=dist; best=ni; }
+                  }
+                }
+              }
+              if(best!==null){
+                d[i]=copy[best];
+                d[i+1]=copy[best+1];
+                d[i+2]=copy[best+2];
+                d[i+3]=maxA;
+              }
+            }
+          }
+        }
+        ctx.putImageData(img,0,0);
+        const out=await c.convertToBlob({type:'image/png'});
+        bmp.close();
+        return out;
+      }catch{ return blob; }
+    }
 
     async function runImglyFast(blob, progressSend, quality){
       const fn=await loadImgly();
@@ -303,9 +400,18 @@ function createWorker(): Worker {
       const sizeSteps=[null,2048,1536,1024];
       for(const maxEdge of sizeSteps){
         let input=blob;
+        let padInfo=null;
         if(maxEdge!==null){
           try{ input=await downscaleBlob(blob, maxEdge); progressSend(18,'Retrying at '+maxEdge+'px…'); }catch{}
         }
+        // Pad 16px transparent border to prevent edge clipping (hand at image border)
+        try{
+          const bmpTmp=await createImageBitmap(input);
+          const iw=bmpTmp.width, ih=bmpTmp.height;
+          bmpTmp.close();
+          padInfo=await padBlob(input, 16);
+          input=padInfo.blob;
+        }catch{}
         for(const model of modelOrder){
           try{
             const res=await fn(input,{
@@ -321,6 +427,12 @@ function createWorker(): Worker {
             });
             let b=res instanceof Blob?res:new Blob([res],{type:'image/png'});
             if(!b || b.size<2000) throw new Error('Empty result');
+            // Unpad to original size before checks
+            if(padInfo){
+              try{ b=await unpadBlob(b, padInfo.pad, padInfo.w, padInfo.h); }catch{}
+            }
+            // Feather expand 1-2px to fix flat cuts (wrist bottom)
+            try{ b=await featherExpandEdge(b); }catch{}
             try{
               const bmp=await createImageBitmap(b);
               const c=new OffscreenCanvas(Math.min(bmp.width,64), Math.min(bmp.height,64));
