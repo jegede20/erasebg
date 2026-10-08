@@ -1,0 +1,13 @@
+node_modules
+.next
+out
+dist
+.env
+.env.local
+.vercel
+.DS_Store
+*.log
+.npm
+.config
+.next
+uploads

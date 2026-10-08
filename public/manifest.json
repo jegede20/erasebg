@@ -1,0 +1,29 @@
+{
+  "name": "Erasebg — Remove any background in seconds",
+  "short_name": "Erasebg",
+  "description": "Free background remover that works on-device. Private, offline, no uploads.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#FAFAFB",
+  "theme_color": "#6C4DFF",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ],
+  "categories": ["photo", "graphics", "utilities"],
+  "orientation": "any"
+}
