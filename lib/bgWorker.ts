@@ -334,26 +334,26 @@ function createWorker(): Worker {
     async function runImglyFast(blob, progressSend, quality){
       const fn=await loadImgly();
       if(!fn) throw new Error('Fast model unavailable');
-      // SPEED+QUALITY: fp16 is 43MB good balance, quint8 22MB fastest fallback, isnet 85MB best quality last
-      const modelOrder = ['isnet_fp16','isnet_quint8','isnet'];
+      // FASTEST: quint8 22MB smallest/fastest, fp16 43MB, isnet 85MB — any image within seconds
+      const modelOrder = ['isnet_quint8','isnet_fp16','isnet'];
       let lastErr=null, outBlob=null;
-      // Pre-downscale large images to 2048 to avoid OOM and speed up — isnet input is 1024 anyway
+      // Any image >1024 is downscaled to 1024 before model — isnet input is 1024, so 1024 is enough for quality and makes large images fast
       let baseBlob = blob;
       try{
         const bmp0=await createImageBitmap(blob);
         const le0=Math.max(bmp0.width,bmp0.height);
         bmp0.close();
-        if(le0>2048){
-          baseBlob=await downscaleBlob(blob, 2048);
-          progressSend(10,'Optimized large image to 2048px for speed…');
+        if(le0>1024){
+          baseBlob=await downscaleBlob(blob, 1024);
+          progressSend(null,'Removing background');
         }
       }catch{}
-      const sizeSteps=[null,1536,1024];
+      const sizeSteps=[null,768,512];
       for(const maxEdge of sizeSteps){
         let input=baseBlob;
         let padInfo=null;
         if(maxEdge!==null){
-          try{ input=await downscaleBlob(baseBlob, maxEdge); progressSend(18,'Retrying at '+maxEdge+'px…'); }catch{}
+          try{ input=await downscaleBlob(baseBlob, maxEdge); progressSend(null,'Removing background'); }catch{}
         }
         // Pad 12px to prevent edge clipping (hand at border)
         try{
@@ -368,11 +368,7 @@ function createWorker(): Worker {
               model,
               output:{format:'image/png', quality:0.92},
               progress:(k,c,t)=>{
-                const pct=20+Math.round(c/t*60);
-                const msg=String(k).toLowerCase().includes('model')
-                  ? 'Downloading '+model+'… '+pct+'%'
-                  : 'Segmenting…';
-                progressSend(pct, msg);
+                progressSend(null,'Removing background');
               }
             });
             const res=await Promise.race([run, timeout]);
@@ -393,8 +389,8 @@ function createWorker(): Worker {
             outBlob=b; lastErr=null; break;
           }catch(err){
             const msg=err?.message||String(err);
-            if(isOOM(err)){ progressSend(55,'Out of memory at '+(maxEdge||'2048px')+', retrying smaller…'); lastErr=err; break; }
-            if(String(msg).includes('timeout')){ progressSend(45,'Timeout on '+model+', trying next…'); lastErr=err; continue; }
+            if(isOOM(err)){ progressSend(null,'Removing background'); lastErr=err; break; }
+            if(String(msg).includes('timeout')){ progressSend(null,'Removing background'); lastErr=err; continue; }
             if(String(msg).includes('No transparency')){ lastErr=err; break; }
             lastErr=err; continue;
           }
@@ -411,9 +407,9 @@ function createWorker(): Worker {
       const send=(m)=>self.postMessage({id, ...m});
       try{
         if(!(blob instanceof Blob) || blob.size===0) throw new Error('Invalid image');
-        send({type:'progress', pct:5, msg:'Preparing image…'});
+        send({type:'progress', pct:null, msg:'Removing background'});
         if(await hasTransparency(blob)){
-          send({type:'progress', pct:95, msg:'Preserving transparency…'});
+          send({type:'progress', pct:null, msg:'Removing background'});
           try{
             const bmp=await createImageBitmap(blob);
             const c=new OffscreenCanvas(bmp.width,bmp.height);
@@ -424,25 +420,17 @@ function createWorker(): Worker {
         }
         if(q==='high'){
           try{
-            send({type:'progress', pct:10, msg:'Loading BiRefNet lite…'});
-            // Add 90s timeout for whole BiRefNet path
+            send({type:'progress', pct:null, msg:'Removing background'});
             const timeoutPromise=new Promise((_,rej)=> setTimeout(()=> rej(new Error('Timeout after 90s')), 90000));
-            const res=await Promise.race([runBiRefNet(blob, (pct,msg)=> send({type:'progress', pct, msg})), timeoutPromise]);
-            send({type:'progress', pct:95, msg:'Finalizing…'});
+            const res=await Promise.race([runBiRefNet(blob, (pct,msg)=> send({type:'progress', pct:null, msg:'Removing background'})), timeoutPromise]);
+            send({type:'progress', pct:null, msg:'Removing background'});
             send({type:'done', blob:res.blob, rawMaskBlob:res.rawMaskBlob, device: res.device, modelId: res.modelId});
             return;
           }catch(err){
             const msg=err?.message||String(err);
-            const isTimeout=msg.includes('Timeout');
-            if(isOOM(err) || isTimeout){
-              send({type:'progress', pct:50, msg: (isTimeout?'Timed out after 90s, ':'') + 'Falling back to Fast…'});
-            }else{
-              send({type:'progress', pct:50, msg:'BiRefNet failed, fallback to Fast…'});
-            }
             console.warn('[BiRefNet] fallback to Fast due to', msg);
             try{
-              const res2=await runImglyFast(blob, (pct,m)=> send({type:'progress', pct, msg:m}), 'fast');
-              send({type:'progress', pct:95, msg:'Fallback done (Fast)'});
+              const res2=await runImglyFast(blob, (pct,m)=> send({type:'progress', pct:null, msg:'Removing background'}), 'fast');
               send({type:'done', blob:res2.blob, rawMaskBlob:null, fallback:true, fallbackReason: msg});
               return;
             }catch(e2){
@@ -450,8 +438,8 @@ function createWorker(): Worker {
             }
           }
         }else{
-          send({type:'progress', pct:15, msg:'Loading Fast model…'});
-          const res=await runImglyFast(blob, (pct,m)=> send({type:'progress', pct, msg:m}), 'fast');
+          send({type:'progress', pct:null, msg:'Removing background'});
+          const res=await runImglyFast(blob, (pct,m)=> send({type:'progress', pct:null, msg:'Removing background'}), 'fast');
           send({type:'done', blob:res.blob, rawMaskBlob:null});
           return;
         }

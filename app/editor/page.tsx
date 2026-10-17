@@ -76,16 +76,8 @@ export default function EditorPage(){
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(()=>{
-    try{ console.log('[Editor] Clean-cut mode (isnet_fp16 via @imgly, balanced quality), crossOriginIsolated:', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown'); }catch{}
+    try{ console.log('[Editor] Fast mode (single message), crossOriginIsolated:', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown'); }catch{}
   },[]);
-  // If processing hangs >20s, nudge user that large images take longer
-  useEffect(()=>{
-    if(!processing) return;
-    const t=setTimeout(()=> {
-      if(processing) setProgressMsg(m=> m.includes('Still working') ? m : (m||'Removing background…') + ' — Still working… large images take longer. You can Cancel and try a smaller image.');
-    }, 20000);
-    return ()=> clearTimeout(t);
-  },[processing]);
 
   // PIPELINE GUARANTEE: file is ALWAYS the original File/Blob.
   // The checker preview (div.checker + overlayRef/canvasRef + p-5 container) is display ONLY.
@@ -147,22 +139,22 @@ export default function EditorPage(){
     setError(null);
     setProcessing(true);
     setProgress(0);
-    setProgressMsg("Preparing…");
+    setProgressMsg("Removing background");
     setFirstTime(isFirstTime());
     const tStart=performance.now();
-    console.log('[Editor] startRemoval', file.name, file.size, 'quality', quality, 'crossOriginIsolated', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown');
+    console.log('[Editor] startRemoval', file.name, file.size, 'quality', quality);
     const ac=new AbortController();
     abortRef.current=ac;
     try {
-      // Safety: auto-downscale huge images before worker to avoid OOM/hang
+      // Fast path: downscale any large image to 1024px max (isnet input is 1024) — makes large images seconds, not minutes
       let prepareBlob: Blob = file;
       try{
         const bmp=await createImageBitmap(file);
         const le=Math.max(bmp.width,bmp.height);
         bmp.close();
-        if(le>2400){
+        if(le>1024){
           const c=document.createElement('canvas');
-          const scale=2400/le;
+          const scale=1024/le;
           const tmp=await createImageBitmap(file);
           const w=Math.round(tmp.width*scale), h=Math.round(tmp.height*scale);
           tmp.close();
@@ -175,28 +167,24 @@ export default function EditorPage(){
           const blob:Blob|null=await new Promise(r=> c.toBlob(b=> r(b), 'image/png', 0.92));
           if(blob) {
             console.log('[Editor] pre-downscaled', file.size, '->', blob.size, w+'x'+h);
-            setProgressMsg('Optimized large image for speed…');
             prepareBlob=blob;
           }
         }
       }catch{}
-      // 50s overall timeout so UI never hangs forever
-      const timeoutMs = 50000;
+      // 60s overall timeout so any image finishes within minutes, never hangs
+      const timeoutMs = 60000;
       const timeoutPromise = new Promise<never>((_,rej)=> {
-        const id=setTimeout(()=> rej(new Error('Timed out after '+(timeoutMs/1000)+'s — try a smaller image or check connection, then Re-run.')), timeoutMs);
+        const id=setTimeout(()=> rej(new Error('Timed out — please try again.')), timeoutMs);
         ac.signal.addEventListener('abort', ()=> { clearTimeout(id); rej(new DOMException('Aborted','AbortError')); });
       });
       const blob: Blob = prepareBlob;
       let outBlob = await Promise.race([
         removeBackgroundViaWorker(blob, (pct, msg)=>{
           if(ac.signal.aborted) return;
-          if(pct !== null && typeof pct === 'number') setProgress(pct);
-          if (msg) setProgressMsg(msg);
-          if (pct !== null && pct > 30) markModelCached();
-          if(msg) console.log('[Editor] progress', pct, msg);
         }, ac.signal, quality),
         timeoutPromise
       ]) as Blob;
+      markModelCached();
       if(ac.signal.aborted) throw new DOMException('Aborted','AbortError');
       console.log('[Editor] done total', Math.round(performance.now()-tStart)+'ms');
       // Capture RAW mask (before compositing) for debug view — prefer worker-provided rawMask (BiRefNet grayscale full-res)
@@ -754,7 +742,7 @@ export default function EditorPage(){
               {processing && (
                 <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 bg-ink text-white dark:bg-white dark:text-ink px-4 py-1.5 rounded-full text-xs font-medium flex items-center gap-2 shadow-md max-w-[90%]">
                   <span className="w-3 h-3 border-2 border-white/30 border-t-white dark:border-ink/30 dark:border-t-ink rounded-full animate-spin shrink-0"/>
-                  <span className="truncate">{progressMsg?.includes('Removing background') ? progressMsg : (progressMsg || "Removing background…")}</span>
+                  <span className="truncate">Removing background</span>
                   <button onClick={()=> abortRef.current?.abort()} className="ml-1 px-2 py-0.5 rounded-full bg-white/15 text-white text-[11px] hover:bg-white/25">Cancel</button>
                 </div>
               )}
@@ -879,19 +867,12 @@ export default function EditorPage(){
               <p className="text-xs text-ink/50 dark:text-white/50 leading-relaxed bg-violet/5 dark:bg-violet/10 rounded-xl p-3 border border-violet/15">Clean model: <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">isnet</code> (~80 MB full / 40 MB quint8 fallback, @imgly, WASM, cached after first load) — best quality, no leftover background, no subject cropping.</p>
               {processing ? (
                 <div className="bg-violet/5 dark:bg-violet/10 rounded-2xl p-4 border border-violet/15">
-                  {progressMsg?.includes('Removing background, this can take') ? (
-                    <div className="flex items-center gap-2 text-xs font-medium">
-                      <span className="w-4 h-4 border-2 border-violet/30 border-t-violet rounded-full animate-spin shrink-0"/>
-                      <span>{progressMsg}</span>
-                    </div>
-                  ) : (
-                    <>
-                      <div className="flex items-center justify-between text-xs font-medium mb-2"><span>{progressMsg}</span><span>{progress}%</span></div>
-                      <div className="h-2 bg-black/5 dark:bg-white/10 rounded-full overflow-hidden"><div className="h-full bg-violet transition-all" style={{width:`${progress}%`}}/></div>
-                    </>
-                  )}
+                  <div className="flex items-center gap-2 text-xs font-medium">
+                    <span className="w-4 h-4 border-2 border-violet/30 border-t-violet rounded-full animate-spin shrink-0"/>
+                    <span>Removing background</span>
+                  </div>
                   <button onClick={()=> abortRef.current?.abort()} className="mt-3 text-xs px-3 py-1.5 rounded-full border border-zinc-200 dark:border-white/10 bg-white dark:bg-dark-surface hover:bg-zinc-50 text-ink/70 dark:text-white/70">Cancel</button>
-                  {firstTime && <p className="text-xs mt-2 bg-white dark:bg-dark-surface border border-zinc-200 dark:border-white/10 rounded-xl px-2.5 py-2 text-ink/60 dark:text-white/60">First time only: download ~40–80MB (isnet) — Wi-Fi recommended on mobile. Cached for offline after.</p>}
+                  {firstTime && <p className="text-xs mt-2 bg-white dark:bg-dark-surface border border-zinc-200 dark:border-white/10 rounded-xl px-2.5 py-2 text-ink/60 dark:text-white/60">First time may take a moment to prepare. Cached for offline after.</p>}
                 </div>
               ) : hasResult ? (
                 <div className="bg-violet/10 border border-violet/20 rounded-2xl p-4 flex gap-3">
