@@ -274,6 +274,9 @@ export default function EditorPage(){
     setShowRawMask(false);
     setError(null);
     setProgress(0);
+    setProgressMsg("Removing background");
+    // Directly start — don't rely solely on useEffect (state is async)
+    setTimeout(()=> startRemoval(file, url), 50);
   };
 
   // refine setup: init mask canvas when resultUrl ready + store original for restore
