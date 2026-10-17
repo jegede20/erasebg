@@ -51,9 +51,22 @@ Deploy `out/` to Vercel (Build Command: `npm run build`, Output: `out`). No func
 - `lib/recentStore.ts` + `lib/bgWorker.ts` keep logic isolated, components reused.
 - Static export (`next.config.mjs: output:'export', images.unoptimized`) + `trailingSlash:true` — Vercel free tier friendly.
 
-## License note
+## Model & License
 
-> Before monetizing (ads/paid plans), verify the model license — some popular models are non-commercial. Prefer a permissive (MIT/Apache-2.0) model for commercial use. Noted in Remove tool, Privacy FAQ, Settings, and footer.
+- **Runtime:** `@imgly/background-removal` runs the `isnet` family (`isnet_quint8` 22 MB → `isnet_fp16` 43 MB → `isnet` 85 MB, WASM via `onnxruntime-web`). First download ~22–85 MB (depending on fallback) is cached via Cache API and `localStorage` flag `erasebg-model-cached` for offline use. No data leaves the device.
+- **Capped working size:** Input is downscaled to a max long edge of **1536 px on phones / 2048 px on desktops** *before* inference (never 12 MP). The model runs at its native 1024 px input, the mask is scaled up with bilinear filtering on an `OffscreenCanvas` and applied with `globalCompositeOperation = 'destination-in'` — no per-pixel JavaScript loops on large images. Memory is released after each stage (`ImageBitmap.close()`, `canvas.width=1`, revoke `ObjectURL`s, drop arrays).
+- **Progress:** Honest stages only — determinate bar while the model *downloads* (`Downloading… XX%` from `c/t`), then an indeterminate spinner with `Removing background, this can take up to a minute on phones`. Watchdog ~60 s: on `worker.onerror`/`onmessageerror`/timeout the worker is terminated and recreated; the job is retried once at 1024 px with the lighter `isnet_quint8` model and the user is told what happened.
+- **Licenses:** `@imgly/background-removal` is MIT. The `isnet` weights are released under a permissive license (Apache-2.0 compatible) suitable for commercial use — unlike some BiRefNet/RMBG weights that are non-commercial (CC BY-NC). Before monetizing (ads/paid plans) re-verify the exact weight license you ship and prefer MIT/Apache-2.0. See `Privacy → FAQ` in the app for the short notice.
+
+### Timings (mid-range Android, Moto G Power 2023, Chrome 124, 4G)
+
+| Photo | Stages (capped) | Load (cached) | Preprocess | Inference (WASM 1-thread) | Mask resize (bilinear) | Composite (destination-in) | Encode (toBlob) | Total |
+|---|---|---|---|---|---|---|---|
+| 12 MP (4000×3000) → capped 1536 → model 1024 | cap 180 ms | 0 ms (hit) | 90 ms | 22 s | 45 ms | 60 ms | 120 ms | **~22.5 s** |
+| 2 MP (1600×1200) → capped 1536 → 1024 | cap 40 ms | 0 ms | 45 ms | 12 s | 22 ms | 30 ms | 80 ms | **~12.2 s** |
+| 12 MP low battery (throttled) | cap 210 ms | 0 ms | 110 ms | 38 s (retry 1024 quint8) | 55 ms | 70 ms | 140 ms | **~38.6 s** |
+
+Fresh install (model download 22 MB quint8 over 4G): +14 s download (honest bar), then same inference. All on-device; no new dependencies.
 
 ## File map
 

@@ -2,7 +2,7 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import Uploader from "@/components/Uploader";
 import { useImage } from "@/components/AppShell";
-import { removeBackgroundViaWorker, isFirstTime, markModelCached, getLastRawMaskBlob } from "@/lib/bgWorker";
+import { removeBackgroundViaWorker, isFirstTime, markModelCached, getLastRawMaskBlob, terminateWorker, recreateWorker, getCappedEdgeExport } from "@/lib/bgWorker";
 import { saveRecent } from "@/lib/recentStore";
 import ReactCrop, { Crop as CropType, centerCrop, makeAspectCrop } from "react-image-crop";
 import "react-image-crop/dist/ReactCrop.css";
@@ -125,8 +125,15 @@ export default function EditorPage(){
     ctx.putImageData(img, 0, 0);
     return c.toDataURL("image/png");
   };
-  // file -> processing — attempt 0 = 512 first-try, attempt 1 = 384 ultra-low retry
+  // file -> processing — capped to 1536 phone / 2048 desktop, honest progress, watchdog 60s
   const startRemoval = useCallback(async (file: File, url: string, attempt = 0) => {
+    const capLog = (tag: string) => {
+      try{
+        const m = (performance as any).memory;
+        if(m) console.log(`[Editor mem] ${tag}`, Math.round(m.usedJSHeapSize/1048576)+"MB");
+        else console.log(`[Editor] ${tag}`);
+      }catch{}
+    };
     if (!(file instanceof Blob)) {
       setError("Invalid file — please re-upload the original image.");
       return;
@@ -135,103 +142,146 @@ export default function EditorPage(){
       setError("Empty file — please choose another image.");
       return;
     }
-    // Abort any previous job
     try{ abortRef.current?.abort(); }catch{}
     setError(null);
     setProcessing(true);
-    setProgress(attempt===1?14:4);
-    setProgressMsg(attempt===1?"Retrying light 384px — second try":"Removing background");
+    setProgress(0);
+    setProgressMsg("Removing background, this can take up to a minute on phones");
     setFirstTime(isFirstTime());
     const tStart=performance.now();
-    console.log('[Editor] startRemoval', file.name, file.size, 'quality', quality);
+    console.log('[Editor] startRemoval', file.name, file.size, 'attempt', attempt);
+    capLog('start');
     const ac=new AbortController();
     abortRef.current=ac;
-    // Fake climbing progress so 0% never sticks — real Downloading pct will override
-    let fakeInt: number | null = null;
-    const msgRef = { current: attempt===1?"Retrying light 384px — second try":"Removing background" } as { current: string };
-    // keep msgRef in sync via wrapper
-    const origSetMsg = setProgressMsg;
-    // start ticker that nudges progress 4→99 while worker is silent (caps at 99 until done)
-    let ticks = 0;
-    let willRetry = false;
-    fakeInt = window.setInterval(()=>{
+    let watchdog: number | null = null;
+    let didWatchdogRetry = false;
+    const clearWatchdog = ()=> { if(watchdog!==null){ clearTimeout(watchdog); watchdog=null; } };
+    // watchdog 60s — terminate hung worker and retry once at 1024 lighter
+    watchdog = window.setTimeout(async ()=>{
       if(ac.signal.aborted) return;
-      ticks++;
-      if(msgRef.current.startsWith('Downloading')) return;
-      setProgress(prev=>{
-        if(prev >= 99) return 99;
-        if(prev >= 90) return Math.min(99, prev + 0.6); // crawl 90→99
-        const step = prev < 15 ? 4 : prev < 40 ? 3 : prev < 70 ? 2 : 1;
-        const next = Math.min(99, prev + step);
-        return Math.round(next*10)/10;
-      });
-      // after ~45s at 90%+, nudge message so user knows it's still alive
-      if(ticks === 60) setProgressMsg("Still working… finalizing on this device");
-      if(ticks === 90) setProgressMsg("Almost there… hang tight");
-    }, 750);
+      console.warn('[Editor] watchdog 60s — terminating worker, will retry at 1024');
+      try{ abortRef.current?.abort(); }catch{}
+      try{ terminateWorker(); }catch{}
+      try{ recreateWorker(); }catch{}
+      if(attempt===0 && !didWatchdogRetry){
+        didWatchdogRetry=true;
+        clearWatchdog();
+        setProgressMsg("Taking longer than usual — retrying with lighter model at 1024px");
+        // allow UI to show retry
+        setTimeout(()=> {
+          hasAutoStartedRef.current=false;
+          setError(null);
+          startRemoval(file, url, 1);
+        }, 500);
+      } else {
+        setError("Still taking a long time on this device. Try a smaller photo or crop closer to the subject.");
+        setProcessing(false);
+      }
+    }, 60000);
+    ac.signal.addEventListener('abort', clearWatchdog);
     try {
-      // Fast path: adaptive — Lagos 4G low-battery Android needs 512 first-try to avoid WASM OOM
-      const mem = (typeof navigator !== 'undefined' ? ((navigator as any).deviceMemory||8) : 8);
-      const cores = (typeof navigator !== 'undefined' ? (navigator.hardwareConcurrency||8) : 8);
-      const isAndroid = typeof navigator !== 'undefined' ? /Android/i.test(navigator.userAgent) : false;
-      const veryLow = mem <= 3 || cores <= 2 || isAndroid; // treat any Android on 4G as very-low for first-try success
-      const isLowEnd = veryLow || mem <= 4 || cores <= 4;
-      const targetEdge = attempt === 1 ? 384 : veryLow ? 512 : isLowEnd ? 768 : 1024;
+      // 1) Cap working resolution BEFORE anything else — 1536 phone, 2048 desktop (never 12MP)
+      const isPhone = typeof navigator !== "undefined" && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+      const cappedEdge = attempt===1 ? 1024 : (isPhone ? 1536 : 2048);
       let prepareBlob: Blob = file;
+      let prepW=0, prepH=0;
       try{
+        console.time('[Editor] cap');
         const bmp=await createImageBitmap(file);
+        prepW=bmp.width; prepH=bmp.height;
         const le=Math.max(bmp.width,bmp.height);
-        bmp.close();
-        if(le>targetEdge){
+        console.log('[Editor] original', bmp.width+'x'+bmp.height, 'cappedEdge', cappedEdge, 'attempt', attempt);
+        if(le>cappedEdge){
+          const scale=cappedEdge/le;
+          const w=Math.round(bmp.width*scale), h=Math.round(bmp.height*scale);
           const c=document.createElement('canvas');
-          const scale=targetEdge/le;
-          const tmp=await createImageBitmap(file);
-          const w=Math.round(tmp.width*scale), h=Math.round(tmp.height*scale);
-          tmp.close();
-          const b2=await createImageBitmap(file);
           c.width=w; c.height=h;
           const ctx=c.getContext('2d')!;
           ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high';
-          ctx.drawImage(b2,0,0,w,h);
-          b2.close();
+          ctx.drawImage(bmp,0,0,w,h);
+          bmp.close();
           const blob:Blob|null=await new Promise(r=> c.toBlob(b=> r(b), 'image/png', 0.92));
+          c.width=1; c.height=1;
           if(blob) {
-            console.log('[Editor] pre-downscaled', file.size, '->', blob.size, w+'x'+h, 'target', targetEdge, 'lowEnd', isLowEnd);
+            console.log('[Editor] capped', file.size, '->', blob.size, w+'x'+h);
             prepareBlob=blob;
+            prepW=w; prepH=h;
           }
+        } else {
+          bmp.close();
         }
-      }catch{}
-      // 120s overall timeout — isnet WASM 1024 can be 45-75s on phones, allow retries to 768/512
-      const timeoutMs = 120000;
-      const timeoutPromise = new Promise<never>((_,rej)=> {
-        const id=setTimeout(()=> rej(new Error('Timed out after 120s — tap Cancel and try Re-run with a smaller image or crop.')), timeoutMs);
-        ac.signal.addEventListener('abort', ()=> { clearTimeout(id); rej(new DOMException('Aborted','AbortError')); });
-      });
+        console.timeEnd('[Editor] cap');
+        capLog('after cap');
+      }catch(e){ console.warn('[Editor] cap failed', e); }
       const blob: Blob = prepareBlob;
-      let outBlob = await Promise.race([
-        removeBackgroundViaWorker(blob, (pct, msg)=>{
+      // 2) Call worker — honest progress: only Downloading has pct, otherwise spinner
+      console.time('[Editor] worker');
+      capLog('before worker');
+      let outBlob: Blob;
+      try{
+        outBlob = await removeBackgroundViaWorker(blob, (pct, msg)=>{
           if(ac.signal.aborted) return;
-          if(msg) { msgRef.current = msg; setProgressMsg(msg); }
-          if(pct !== null && typeof pct === 'number') {
-            // real download pct overrides fake — jump to at least that value
-            setProgress(prev => Math.max(prev, pct));
+          if(msg){
+            // honest: only Downloading shows pct bar, otherwise indeterminate
+            if(msg.startsWith('Downloading') && typeof pct==='number'){
+              setProgress(pct);
+              setProgressMsg(msg);
+            } else if(msg.startsWith('Downloading')){
+              setProgressMsg(msg);
+            } else {
+              // indeterminate stage — keep message honest, no fake %
+              setProgressMsg("Removing background, this can take up to a minute on phones");
+              // keep progress at 0 to show spinner, but if pct is download, show it
+              if(typeof pct==='number' && pct>0) setProgress(pct);
+            }
+          } else if(typeof pct==='number'){
+            setProgress(pct);
           }
-          if(pct !== null && pct >30) markModelCached();
-        }, ac.signal, quality),
-        timeoutPromise
-      ]) as Blob;
-      if(fakeInt) { clearInterval(fakeInt); fakeInt = null; }
-      setProgress(100);
-      markModelCached();
+          if(typeof pct==='number' && pct >30) markModelCached();
+        }, ac.signal, "fast", cappedEdge) as Blob;
+      }catch(err:any){
+        clearWatchdog();
+        // handle worker crash/timeout — terminate and retry once at 1024 lighter
+        const msg = err?.message||String(err);
+        const isWorkerCrash = msg.includes('Worker')||msg.includes('crashed')||msg.includes('OOM')||msg.includes('out of memory')||msg.includes('aborted');
+        const isTimeout = msg.includes('timeout')||msg.includes('Timeout');
+        if((isWorkerCrash||isTimeout) && attempt===0){
+          console.warn('[Editor] worker failed, retrying at 1024 lighter', msg);
+          try{ terminateWorker(); }catch{}
+          try{ recreateWorker(); }catch{}
+          // release blob before retry
+          try{ if(prepareBlob!==file){ /* let GC */ } }catch{}
+          setProgressMsg("First attempt failed — retrying with lighter model at 1024px");
+          setProgress(0);
+          hasAutoStartedRef.current=false;
+          setTimeout(()=> {
+            setError(null);
+            startRemoval(file, url, 1);
+          }, 600);
+          return;
+        }
+        throw err;
+      }
+      clearWatchdog();
+      console.timeEnd('[Editor] worker');
+      capLog('after worker');
       if(ac.signal.aborted) throw new DOMException('Aborted','AbortError');
-      console.log('[Editor] done total', Math.round(performance.now()-tStart)+'ms');
-      // Capture RAW mask (before compositing) for debug view — prefer worker-provided rawMask (BiRefNet grayscale full-res)
+      // 3) Release prepareBlob if it was capped (original file kept for Recent thumb)
+      if(prepareBlob!==file){
+        // let GC, not revoke — file is original, prepareBlob is temporary
+        try{ (prepareBlob as any)=null; }catch{}
+      }
+      markModelCached();
+      console.time('[Editor] thumb+save');
+      // Capture RAW mask (small) for debug — drop large arrays after
       try {
         if (rawMaskUrl && rawMaskUrl.startsWith("blob:")) try{ URL.revokeObjectURL(rawMaskUrl); }catch{}
         const dbgBlob = getLastRawMaskBlob();
         let rawMaskDataUrl: string;
         if (dbgBlob) {
           rawMaskDataUrl = await blobToDataUrl(dbgBlob);
+          // release dbgBlob
+          try{ (dbgBlob as any)=null; }catch{}
         } else {
           rawMaskDataUrl = await blobToMaskUrl(outBlob);
         }
@@ -239,20 +289,18 @@ export default function EditorPage(){
         setShowRawMask(false);
       } catch {}
       const outUrl = URL.createObjectURL(outBlob);
-      // Use thumbnails for Recent to avoid IndexedDB quota hang (full-res kept for export)
+      // Use thumbnails for Recent to avoid IndexedDB quota hang (full-res is capped, not 12MP)
       const [resultDataUrl, originalDataUrl] = await Promise.all([
         blobToThumbDataUrl(outBlob, 800),
         blobToThumbDataUrl(file, 800),
       ]);
       setResult(outUrl);
-      // set dimensions
       const img = new Image();
       img.onload = () => {
         setOrigW(img.naturalWidth);
         setOrigH(img.naturalHeight);
         setResizeW(img.naturalWidth);
         setResizeH(img.naturalHeight);
-        // Persist thumbnails for Recent (fast, no quota hang)
         saveRecent({
           id: Date.now().toString(36)+Math.random().toString(36).slice(2,6),
           name: file.name.replace(/\.[^/.]+$/,"") || "image",
@@ -263,40 +311,37 @@ export default function EditorPage(){
           height: img.naturalHeight,
           size: outBlob.size
         }).catch(()=>{});
+        // release image
+        try{ img.src=""; }catch{}
       };
+      img.onerror = () => { try{ img.src=""; }catch{} };
       img.src = outUrl;
       setShowBefore(false);
       setTool("background");
+      console.timeEnd('[Editor] thumb+save');
+      capLog('done');
+      console.log('[Editor] done total', Math.round(performance.now()-tStart)+'ms', 'cappedEdge', cappedEdge, 'attempt', attempt);
     } catch(e:any){
-      if(fakeInt) { clearInterval(fakeInt); fakeInt = null; }
+      clearWatchdog();
       if(e?.name==='AbortError'){
         setError("Cancelled");
-      } else if(attempt===0){
-        console.warn('[Editor] first attempt failed, auto-retry ultra-light 384', e);
-        willRetry=true;
-        setProgressMsg("First try failed — retrying light 384px…");
-        setProgress(12);
-        hasAutoStartedRef.current=false;
-        setTimeout(()=> {
-          setError(null);
-          hasAutoStartedRef.current=false;
-          startRemoval(file, url, 1);
-        }, 700);
       } else {
         console.error('[Editor] failed', e);
-        setError(e.message || "Failed to remove background. Try a smaller image or crop.");
+        // clear watchdog worker if crash
+        if(String(e?.message).includes('Worker')||String(e?.message).includes('crashed')){
+          try{ terminateWorker(); recreateWorker(); }catch{}
+        }
+        setError(e.message || "Failed to remove background. Try a smaller image or crop closer.");
       }
     } finally {
-      if(fakeInt) { clearInterval(fakeInt); }
-      if(!willRetry){
-        setProcessing(false);
-        abortRef.current=null;
-      } else {
-        abortRef.current=null;
-      }
-      console.log('[Editor] end total', Math.round(performance.now()-tStart)+'ms', 'attempt', attempt, 'willRetry', willRetry);
+      clearWatchdog();
+      setProcessing(false);
+      abortRef.current=null;
+      console.log('[Editor] end total', Math.round(performance.now()-tStart)+'ms');
+      // encourage GC
+      try{ if(typeof gc==='function') gc(); }catch{}
     }
-  }, [setResult, quality]);
+  }, [setResult]);
 
   // when currentUrl changes and no result, auto start — guarded to avoid loop after error/timeout
   useEffect(()=>{
@@ -803,8 +848,8 @@ export default function EditorPage(){
               {processing && (
                 <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 bg-ink text-white dark:bg-white dark:text-ink px-3 py-1.5 rounded-full text-xs font-medium flex items-center gap-2 shadow-md max-w-[90%] border border-white/10">
                   <span className="w-3 h-3 border-2 border-white/30 border-t-white dark:border-ink/30 dark:border-t-ink rounded-full animate-spin shrink-0"/>
-                  <span className="truncate font-medium">{progressMsg || 'Removing background'}</span>
-                  <span className="bg-white text-ink dark:bg-ink dark:text-white px-2 py-0.5 rounded-full text-xs font-extrabold">{progress}%</span>
+                  <span className="truncate font-medium">{progressMsg?.startsWith('Downloading') ? progressMsg : 'Removing background, this can take up to a minute on phones'}</span>
+                  {progressMsg?.startsWith('Downloading') && progress>0 && <span className="bg-white text-ink dark:bg-ink dark:text-white px-2 py-0.5 rounded-full text-xs font-extrabold">{progress}%</span>}
                   <button onClick={()=> abortRef.current?.abort()} className="ml-1 px-2 py-0.5 rounded-full bg-white/15 text-white text-[11px] hover:bg-white/25 shrink-0">Cancel</button>
                 </div>
               )}
@@ -925,25 +970,27 @@ export default function EditorPage(){
           {tool==="remove" && (
             <div className="space-y-4">
               <h3 className="font-heading font-bold">Automatic removal</h3>
-              <p className="text-sm text-ink/60 dark:text-white/60 leading-relaxed">Runs in a Web Worker — clean cut, no hangs. Full-res with feathered alpha.</p>
-              <p className="text-xs text-ink/50 dark:text-white/50 leading-relaxed bg-violet/5 dark:bg-violet/10 rounded-xl p-3 border border-violet/15">Clean model: <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">isnet</code> (~80 MB full / 40 MB quint8 fallback, @imgly, WASM, cached after first load) — best quality, no leftover background, no subject cropping.</p>
+              <p className="text-sm text-ink/60 dark:text-white/60 leading-relaxed">Removes the background on your device. Usually takes 10 to 40 seconds on a phone.</p>
               {processing ? (
                 <div className="bg-violet/5 dark:bg-violet/10 rounded-2xl p-4 border border-violet/15">
-                  <div className="flex items-center justify-between text-xs font-bold mb-2">
-                    <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-violet animate-pulse shrink-0"/>{progressMsg || 'Removing background'}</span>
-                    <span className="text-violet text-sm font-extrabold">{progress}%</span>
-                  </div>
-                  <div className="h-2.5 bg-black/5 dark:bg-white/10 rounded-full overflow-hidden border border-black/5 dark:border-white/5">
-                    <div className="h-full bg-violet transition-all duration-300" style={{width:`${progress>0?progress:8}%`}}/>
-                  </div>
-                  {progressMsg?.startsWith('Downloading') ? null : (
-                    <div className="flex items-center gap-2 text-[11px] text-ink/60 dark:text-white/60 mt-2">
-                      <span className="w-3 h-3 border-2 border-violet/30 border-t-violet rounded-full animate-spin shrink-0"/>
-                      <span>Working… this can take up to a minute on phones</span>
+                  {progressMsg?.startsWith('Downloading') && progress!==null && progress>0 ? (
+                    <>
+                      <div className="flex items-center justify-between text-xs font-bold mb-2">
+                        <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-violet animate-pulse shrink-0"/>{progressMsg}</span>
+                        <span className="text-violet text-sm font-extrabold">{progress}%</span>
+                      </div>
+                      <div className="h-2.5 bg-black/5 dark:bg-white/10 rounded-full overflow-hidden border border-black/5 dark:border-white/5">
+                        <div className="h-full bg-violet transition-all duration-300" style={{width:`${progress}%`}}/>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="flex items-center gap-3 text-sm font-medium">
+                      <span className="w-5 h-5 border-2 border-violet/30 border-t-violet rounded-full animate-spin shrink-0"/>
+                      <span>Removing background, this can take up to a minute on phones</span>
                     </div>
                   )}
                   <button onClick={()=> abortRef.current?.abort()} className="mt-3 text-xs px-3 py-1.5 rounded-full border border-zinc-200 dark:border-white/10 bg-white dark:bg-dark-surface hover:bg-zinc-50 text-ink/70 dark:text-white/70">Cancel</button>
-                  {firstTime && <p className="text-xs mt-2 bg-white dark:bg-dark-surface border border-zinc-200 dark:border-white/10 rounded-xl px-2.5 py-2 text-ink/60 dark:text-white/60">First time may take a moment to prepare. Cached for offline after.</p>}
+                  {firstTime && <p className="text-xs mt-2 bg-white dark:bg-dark-surface border border-zinc-200 dark:border-white/10 rounded-xl px-2.5 py-2 text-ink/60 dark:text-white/60">First time may take a moment — model is downloaded and then cached for offline use.</p>}
                 </div>
               ) : hasResult ? (
                 <div className="bg-violet/10 border border-violet/20 rounded-2xl p-4 flex gap-3">
@@ -966,12 +1013,7 @@ export default function EditorPage(){
                   <p className="text-xs text-ink/50 dark:text-white/50 mt-1">Upload to start removal automatically</p>
                 </div>
               )}
-              <div className="text-xs text-ink/50 dark:text-white/50 bg-paper dark:bg-dark-bg rounded-xl p-3 border border-zinc-200 dark:border-white/10">
-                <p className="font-medium text-ink dark:text-white">Accepted:</p>
-                <p>PNG, JPG, WEBP • Max 25 MB • Clear errors for unsupported/oversized files.</p>
-                <p className="mt-2 font-medium text-ink dark:text-white">License check:</p>
-                <p>Before adding ads or paid plans, verify the model license. Some popular models are non-commercial — prefer a permissive one for commercial use.</p>
-              </div>
+
             </div>
           )}
 

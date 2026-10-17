@@ -1,29 +1,36 @@
 "use client";
-// Unified: isnet (clean cut) primary — no leftover bg, no subject cropping
-// - Fast/Clean = @imgly/background-removal isnet (full) > isnet_fp16 > isnet_quint8 fallback
-// - BiRefNet lite kept as optional High (WebGPU 1024 / WASM 512) but default is isnet for reliability
-// - Real download progress only, inference shows indeterminate spinner
-// - Multi-threaded WASM via COOP/COEP headers, timeout 90s fallback
+// Erasebg worker — on-device isnet, capped resolution, honest progress, no large per-pixel loops
 
 export type ProgressCb = (pct: number | null, msg?: string) => void;
 export type Quality = "high" | "fast";
 
 let workerInstance: Worker | null = null;
+let workerUrl: string | null = null;
+
+function getCappedEdge(): number {
+  try {
+    const isPhone = typeof navigator !== "undefined" && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    return isPhone ? 1536 : 2048;
+  } catch { return 1536; }
+}
 
 function createWorker(): Worker {
   const code = `
-    let transformersMod = null;
-    let birefProcessor = null;
-    let birefModel = null;
-    let birefDevice = null;
-    let birefDtype = null;
-    let currentModelId = null;
     let removeBackgroundFn = null;
     let loadPromise = null;
-    self.onerror = function(e){ try{ const m=e.message||e.error?.message||String(e); self.postMessage({type:'error', error:m.slice(0,900)}); }catch{} };
-    self.onunhandledrejection = function(e){ try{ const m=e.reason?.message||String(e.reason||e); self.postMessage({type:'error', error:m.slice(0,900)}); }catch{} };
+    let memLog = (tag)=>{
+      try{
+        const m = (performance && performance.memory) ? performance.memory : null;
+        if(m) console.log('[Worker mem] '+tag, Math.round(m.usedJSHeapSize/1048576)+'MB / '+Math.round(m.jsHeapSizeLimit/1048576)+'MB');
+        else console.log('[Worker mem] '+tag, 'performance.memory n/a');
+      }catch{}
+    };
 
-    async function loadImgly(){
+    self.onerror = function(e){ try{ const m=e.message||e.error?.message||String(e); self.postMessage({type:'error', error:m.slice(0,1000)}); }catch{} };
+    self.onunhandledrejection = function(e){ try{ const m=e.reason?.message||String(e.reason||e); self.postMessage({type:'error', error:m.slice(0,1000)}); }catch{} };
+    self.onmessageerror = function(e){ try{ self.postMessage({type:'error', error:'onmessageerror '+String(e)}); }catch{} };
+
+    async function loadImgly(progressSend){
       if(removeBackgroundFn) return removeBackgroundFn;
       if(loadPromise) return loadPromise;
       const importWithTimeout=(url, ms=15000)=> Promise.race([import(url), new Promise((_,rej)=> setTimeout(()=> rej(new Error('import timeout '+url)), ms))]);
@@ -36,285 +43,82 @@ function createWorker(): Worker {
         ];
         for(const u of urls){
           try{
+            console.time('[Worker] load '+u);
             const mod=await importWithTimeout(u, 15000);
+            console.timeEnd('[Worker] load '+u);
+            memLog('after load '+u);
             const fn=mod.removeBackground||mod.default?.removeBackground||mod.default;
             if(fn){ removeBackgroundFn=fn; return fn; }
-          }catch(e){}
+          }catch(e){ console.warn('[Worker] load fail', u, e?.message||e); }
         }
-        return null;
+        throw new Error('Failed to load background-removal — CDN blocked. Try Wi-Fi.');
       })();
       return loadPromise;
     }
 
-    async function loadTransformers(){
-      if(transformersMod) return transformersMod;
-      const importWithTimeout=(url, ms=8000)=> Promise.race([import(url), new Promise((_,rej)=> setTimeout(()=> rej(new Error('import timeout')), ms))]);
-      const urls=[
-        'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.1/+esm',
-        'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.0/+esm',
-        'https://unpkg.com/@huggingface/transformers@3.7.1/+esm'
-      ];
-      for(const u of urls){
-        try{
-          const mod=await importWithTimeout(u, 8000);
-          if(mod.env && mod.AutoModel && mod.AutoProcessor && mod.RawImage){
-            try{
-              mod.env.allowRemoteModels = true;
-              mod.env.allowLocalModels = false;
-              mod.env.useBrowserCache = true;
-              const isIsolated = typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : false;
-              console.log('[BiRefNet] crossOriginIsolated:', isIsolated, 'hardwareConcurrency:', (typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : 'unknown'));
-              if(mod.env.backends && mod.env.backends.onnx && mod.env.backends.onnx.wasm){
-                // Enable multi-thread + SIMD when isolated
-                if(isIsolated){
-                  mod.env.backends.onnx.wasm.numThreads = Math.min(4, (typeof navigator !== 'undefined' ? navigator.hardwareConcurrency || 4 : 4));
-                  mod.env.backends.onnx.wasm.simd = true;
-                } else {
-                  mod.env.backends.onnx.wasm.numThreads = 1;
-                }
-                mod.env.backends.onnx.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0-dev.20250409-89f8206ba4/dist/';
-              }
-            }catch{}
-            transformersMod=mod;
-            return mod;
-          }
-        }catch(e){}
-      }
-      throw new Error('Failed to load transformers');
-    }
-
-    function hasWebGPU(){
-      try{
-        if(typeof navigator !== 'undefined' && navigator.gpu) return true;
-        if(typeof self !== 'undefined' && self.navigator && self.navigator.gpu) return true;
-      }catch{}
-      return false;
-    }
-
-    async function ensureBiRefNet(progressSend){
-      if(birefModel && birefProcessor) return {processor:birefProcessor, model:birefModel, device:birefDevice, dtype:birefDtype, modelId: currentModelId};
-      const mod=await loadTransformers();
-      const { AutoModel, AutoProcessor } = mod;
-      const useWebGPU = hasWebGPU();
-      console.log('[BiRefNet] hasWebGPU:', useWebGPU);
-      // NEVER use 1024 on WASM — only 512 on WASM
-      const modelId = useWebGPU ? 'onnx-community/BiRefNet_lite' : 'onnx-community/BiRefNet_512x512-ONNX';
-      const fallbackId = useWebGPU ? 'onnx-community/BiRefNet_lite-ONNX' : null;
-      const attempts = useWebGPU
-        ? [{device:'webgpu', dtype:'fp32', label:'WebGPU fp32 1024'}, {device:'webgpu', dtype:'fp16', label:'WebGPU fp16 1024'}]
-        : [{device:'wasm', dtype:'q8', label:'WASM q8 512'}, {device:'wasm', dtype:'fp32', label:'WASM fp32 512'}, {device:'wasm', dtype:'fp16', label:'WASM fp16 512'}];
-      let lastErr=null;
-      for(const att of attempts){
-        const tryIds = fallbackId ? [modelId, fallbackId] : [modelId];
-        for(const id of tryIds){
-          try{
-            console.time('[BiRefNet] load '+id+' '+att.label);
-            progressSend(12, 'Loading BiRefNet lite ('+att.label+')…');
-            const progress_callback = (data)=>{
-              try{
-                if(data.status==='progress' && data.file){
-                  const pct=Math.round(data.progress||0);
-                  const single=10+Math.round(pct*0.5);
-                  // Real download progress only
-                  progressSend(single, 'Downloading BiRefNet… '+pct+'%');
-                  console.log('[BiRefNet] download', data.file, pct+'%');
-                }
-              }catch{}
-            };
-            const processor=await AutoProcessor.from_pretrained(id, { progress_callback });
-            const model=await AutoModel.from_pretrained(id, {
-              device: att.device,
-              dtype: att.dtype,
-              progress_callback,
-            });
-            console.timeEnd('[BiRefNet] load '+id+' '+att.label);
-            birefProcessor=processor;
-            birefModel=model;
-            birefDevice=att.device;
-            birefDtype=att.dtype;
-            currentModelId=id;
-            // During inference we will show indeterminate spinner, not fake %
-            progressSend(null, 'Removing background, this can take up to a minute on phones');
-            return {processor, model, device: att.device, dtype: att.dtype, modelId: id};
-          }catch(e){
-            lastErr=e;
-            console.warn('[BiRefNet] failed', id, att.label, e?.message||e);
-            continue;
-          }
-        }
-      }
-      throw lastErr||new Error('BiRefNet lite failed to load');
-    }
-
     function isOOM(err){
       const m=(err?.message||String(err)).toLowerCase();
-      return m.includes('memory')||m.includes('oom')||m.includes('allocation')||m.includes('out of memory')||m.includes('aborted')||m.includes('exceed')||m.includes('runtimeerror')||m.includes('wasm')||m.includes('failed to allocate');
+      return m.includes('memory')||m.includes('oom')||m.includes('allocation')||m.includes('out of memory')||m.includes('aborted')||m.includes('exceed')||m.includes('runtimeerror')||m.includes('wasm')||m.includes('failed to allocate')||m.includes('cannot allocate');
     }
+
     async function hasTransparency(blob){
+      let bmp=null;
       try{
-        const bmp=await createImageBitmap(blob);
+        bmp=await createImageBitmap(blob);
         const w=Math.min(bmp.width,64), h=Math.min(bmp.height,64);
         const c=new OffscreenCanvas(w,h);
         const ctx=c.getContext('2d');
         ctx.drawImage(bmp,0,0,w,h);
         const d=ctx.getImageData(0,0,w,h).data;
         let t=0; for(let i=3;i<d.length;i+=4) if(d[i]<250) t++;
-        bmp.close();
-        return t/(d.length/4) > 0.08;
-      }catch{ return false; }
-    }
-
-    async function runBiRefNet(blob, progressSend){
-      const t0=performance.now();
-      const mod=await loadTransformers();
-      const { RawImage } = mod;
-      console.time('[BiRefNet] ensure');
-      const { processor, model, device } = await ensureBiRefNet(progressSend);
-      console.timeEnd('[BiRefNet] ensure');
-      console.log('[BiRefNet] device', device, 'crossOriginIsolated', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown');
-      if(await hasTransparency(blob)){
-        progressSend(95,'Preserving transparency…');
-        const bmp=await createImageBitmap(blob);
-        const c=new OffscreenCanvas(bmp.width,bmp.height);
-        const ctx=c.getContext('2d'); ctx.drawImage(bmp,0,0);
-        const out=await c.convertToBlob({type:'image/png'});
-        bmp.close();
-        return { blob: out, rawMaskBlob: null, device };
-      }
-      const tp0=performance.now();
-      console.time('[BiRefNet] preprocess');
-      progressSend(null,'Removing background, this can take up to a minute on phones');
-      const image=await RawImage.fromBlob(blob);
-      const origW=image.width, origH=image.height;
-      const fullBmp=await createImageBitmap(blob);
-      const fullW=fullBmp.width, fullH=fullBmp.height;
-      // On WASM we already use 512 model, so input is limited to 512 naturally via processor
-      let pixel_values;
-      try{
-        const out=await processor(image);
-        pixel_values=out.pixel_values || out.input_image || out[Object.keys(out)[0]];
-        if(!pixel_values && out && out.data) pixel_values=out;
-      }catch(e){ throw new Error('Preprocess failed: '+(e?.message||e)); }
-      if(!pixel_values) throw new Error('Processor returned no pixel_values');
-      console.timeEnd('[BiRefNet] preprocess');
-      console.log('[BiRefNet] preprocess', Math.round(performance.now()-tp0)+'ms', 'input', pixel_values.dims || pixel_values.shape, 'orig', origW+'x'+origH);
-
-      const ti0=performance.now();
-      console.time('[BiRefNet] inference');
-      // Indeterminate spinner during inference
-      progressSend(null,'Removing background, this can take up to a minute on phones');
-      let outputs;
-      try{
-        try{
-          outputs=await model({ input_image: pixel_values });
-        }catch(e1){
-          try{ outputs=await model({ pixel_values }); }catch(e2){
-            outputs=await model(pixel_values);
-          }
-        }
-      }catch(e){ throw new Error('Inference failed: '+(e?.message||e)); }
-      console.timeEnd('[BiRefNet] inference');
-      console.log('[BiRefNet] inference', Math.round(performance.now()-ti0)+'ms');
-
-      const tp1=performance.now();
-      console.time('[BiRefNet] postprocess');
-      progressSend(null,'Removing background, this can take up to a minute on phones');
-      let tensor=outputs?.output_image || outputs?.logits || outputs?.pred_masks || outputs?.output || outputs?.[0];
-      if(!tensor){
-        for(const k of Object.keys(outputs||{})){
-          const v=outputs[k];
-          if(v && v.data && v.dims){ tensor=v; break; }
-          if(v && Array.isArray(v) && v[0] && v[0].data) { tensor=v[0]; break; }
-        }
-      }
-      if(!tensor) throw new Error('No output tensor');
-      if(Array.isArray(tensor)) tensor=tensor[0];
-      const dims=tensor.dims || tensor.shape;
-      if(!dims) throw new Error('Tensor dims missing');
-      const data=tensor.data;
-      let h=dims[dims.length-2], w=dims[dims.length-1];
-      let flat=data;
-      if(flat.length > h*w){
-        flat=flat.slice(flat.length - h*w);
-      }
-      let corrupted=false;
-      if(device==='webgpu'){
-        let nanCount=0;
-        for(let i=0;i<Math.min(1000, flat.length); i++) if(isNaN(flat[i])) nanCount++;
-        if(nanCount>10) corrupted=true;
-      }
-      if(corrupted) throw new Error('WebGPU fp16 output corrupted, need fp32');
-      const maskU8=new Uint8Array(h*w);
-      for(let i=0;i<h*w;i++){
-        const v=flat[i];
-        const sig=1/(1+Math.exp(-v));
-        maskU8[i]=Math.round(sig*255);
-      }
-      const maskCanvas=new OffscreenCanvas(w,h);
-      const mctx=maskCanvas.getContext('2d');
-      const imgData=mctx.createImageData(w,h);
-      for(let i=0;i<h*w;i++){
-        const v=maskU8[i];
-        imgData.data[i*4]=v;
-        imgData.data[i*4+1]=v;
-        imgData.data[i*4+2]=v;
-        imgData.data[i*4+3]=255;
-      }
-      mctx.putImageData(imgData,0,0);
-      const fullMaskCanvas=new OffscreenCanvas(fullW, fullH);
-      const fctx=fullMaskCanvas.getContext('2d');
-      fctx.imageSmoothingEnabled=true;
-      fctx.imageSmoothingQuality='high';
-      fctx.drawImage(maskCanvas,0,0,w,h,0,0,fullW,fullH);
-      const fullMaskData=fctx.getImageData(0,0,fullW,fullH);
-      const outCanvas=new OffscreenCanvas(fullW, fullH);
-      const octx=outCanvas.getContext('2d');
-      octx.drawImage(fullBmp,0,0);
-      fullBmp.close();
-      const outData=octx.getImageData(0,0,fullW,fullH);
-      for(let i=0;i<fullW*fullH;i++){
-        const maskVal=fullMaskData.data[i*4];
-        outData.data[i*4+3]=maskVal;
-      }
-      octx.putImageData(outData,0,0);
-      const outBlob=await outCanvas.convertToBlob({type:'image/png'});
-      const rawMaskBlob=await fullMaskCanvas.convertToBlob({type:'image/png'});
-      console.timeEnd('[BiRefNet] postprocess');
-      console.log('[BiRefNet] postprocess', Math.round(performance.now()-tp1)+'ms', 'total', Math.round(performance.now()-t0)+'ms');
-      return { blob: outBlob, rawMaskBlob, device, modelId: currentModelId };
+        const res = t/(d.length/4) > 0.08;
+        bmp.close(); bmp=null;
+        c.width=1; c.height=1;
+        return res;
+      }catch{ try{ bmp && bmp.close(); }catch{} return false; }
     }
 
     async function downscaleBlob(blob, maxEdge){
-      const bmp=await createImageBitmap(blob);
-      const le=Math.max(bmp.width,bmp.height);
-      if(le<=maxEdge){ bmp.close(); return blob; }
-      const s=maxEdge/le, w=Math.round(bmp.width*s), h=Math.round(bmp.height*s);
-      const c=new OffscreenCanvas(w,h);
-      const ctx=c.getContext('2d');
-      ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high';
-      ctx.drawImage(bmp,0,0,w,h);
-      const out=await c.convertToBlob({type:'image/png'});
-      bmp.close();
-      return out;
-    }
-    // Edge preservation: small transparent padding prevents clipping at image borders (e.g. wrist at bottom)
-    async function padBlob(blob, pad){
+      let bmp=null;
       try{
-        const bmp=await createImageBitmap(blob);
+        bmp=await createImageBitmap(blob);
+        const le=Math.max(bmp.width,bmp.height);
+        if(le<=maxEdge){ bmp.close(); return blob; }
+        const s=maxEdge/le, w=Math.round(bmp.width*s), h=Math.round(bmp.height*s);
+        console.time('[Worker] downscale '+maxEdge);
+        const c=new OffscreenCanvas(w,h);
+        const ctx=c.getContext('2d');
+        ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high';
+        ctx.drawImage(bmp,0,0,w,h);
+        bmp.close(); bmp=null;
+        const out=await c.convertToBlob({type:'image/png'});
+        c.width=1; c.height=1;
+        console.timeEnd('[Worker] downscale '+maxEdge);
+        memLog('after downscale '+maxEdge);
+        return out;
+      }catch(e){ try{ bmp && bmp.close(); }catch{} throw e; }
+    }
+
+    async function padBlob(blob, pad){
+      let bmp=null;
+      try{
+        bmp=await createImageBitmap(blob);
         const c=new OffscreenCanvas(bmp.width+pad*2, bmp.height+pad*2);
         const ctx=c.getContext('2d');
         ctx.clearRect(0,0,c.width,c.height);
         ctx.drawImage(bmp, pad, pad);
         const out=await c.convertToBlob({type:'image/png'});
         const w=bmp.width, h=bmp.height;
-        bmp.close();
+        bmp.close(); bmp=null;
+        c.width=1; c.height=1;
         return {blob:out, w, h, pad};
-      }catch{ return {blob, w:0, h:0, pad:0}; }
+      }catch{ try{ bmp && bmp.close(); }catch{} return {blob, w:0, h:0, pad:0}; }
     }
     async function unpadBlob(paddedBlob, pad, origW, origH){
       if(!pad || !origW) return paddedBlob;
+      let bmp=null;
       try{
-        const bmp=await createImageBitmap(paddedBlob);
+        bmp=await createImageBitmap(paddedBlob);
         const c=new OffscreenCanvas(origW, origH);
         const ctx=c.getContext('2d');
         const expectedW = origW + pad*2;
@@ -322,151 +126,185 @@ function createWorker(): Worker {
         if(bmp.width===expectedW && bmp.height===expectedH){
           ctx.drawImage(bmp, -pad, -pad);
         } else {
-          // Fallback: center crop / scale to orig
           const sx = Math.max(0, (bmp.width - origW)/2);
           const sy = Math.max(0, (bmp.height - origH)/2);
           ctx.drawImage(bmp, sx, sy, origW, origH, 0, 0, origW, origH);
         }
         const out=await c.convertToBlob({type:'image/png'});
-        bmp.close();
+        bmp.close(); bmp=null;
+        c.width=1; c.height=1;
         return out;
-      }catch{ return paddedBlob; }
+      }catch{ try{ bmp && bmp.close(); }catch{} return paddedBlob; }
     }
 
-    async function runImglyFast(blob, progressSend, quality){
-      const fn=await loadImgly();
-      if(!fn) throw new Error('Fast model unavailable — CDN blocked, try on Wi-Fi or VPN');
-      // FASTEST: quint8 22MB smallest/fastest, fp16 43MB, isnet 85MB — any image within seconds
+    async function runImglyCapped(blob, progressSend, cappedEdge){
+      const fn=await loadImgly(progressSend);
+      if(!fn) throw new Error('Model unavailable');
       const modelOrder = ['isnet_quint8','isnet_fp16','isnet'];
-      let lastErr=null, outBlob=null;
-      // Adaptive downscale: 768 on low-end already done in editor, but keep 1024 cap here for desktop
+      let lastErr=null;
+      // Ensure input is capped before model (capped already in main thread, but enforce)
       let baseBlob = blob;
       try{
-        const bmp0=await createImageBitmap(blob);
-        const le0=Math.max(bmp0.width,bmp0.height);
-        bmp0.close();
-        if(le0>1024){
-          baseBlob=await downscaleBlob(blob, 1024);
-          progressSend(null,'Optimized large image to 1024px for speed…');
+        const bmp=await createImageBitmap(blob);
+        const le=Math.max(bmp.width,bmp.height);
+        bmp.close();
+        if(le>cappedEdge){
+          console.time('[Worker] cap '+cappedEdge);
+          baseBlob=await downscaleBlob(blob, cappedEdge);
+          console.timeEnd('[Worker] cap '+cappedEdge);
+          progressSend(null,'Removing background, this can take up to a minute on phones');
         }
       }catch{}
-      const sizeSteps=[null,768,512,384];
+      // Model native is 1024 — isnet input is 1024, so 1024 is enough; larger is waste
+      const modelNative = 1024;
+      // Retry sizes: capped -> 1024 -> 768 -> 512
+      const candidates = [];
+      const leBase = await (async()=>{ try{ const b=await createImageBitmap(baseBlob); const v=Math.max(b.width,b.height); b.close(); return v;}catch{return cappedEdge;}})();
+      if(leBase>modelNative) candidates.push(modelNative);
+      candidates.push(768,512);
+      // unique and sorted descending, keep capped if different
+      const sizeSteps = [null, ...candidates.filter((v,i,a)=> a.indexOf(v)===i)];
+      console.log('[Worker] runImglyCapped capped', cappedEdge, 'base', leBase, 'steps', sizeSteps, 'models', modelOrder);
+      memLog('before run loop');
       for(const maxEdge of sizeSteps){
         let input=baseBlob;
         let padInfo=null;
         if(maxEdge!==null){
-          try{ input=await downscaleBlob(baseBlob, maxEdge); progressSend(null,'Retrying at '+maxEdge+'px…'); }catch{}
+          try{
+            console.time('[Worker] downscale step '+maxEdge);
+            input=await downscaleBlob(baseBlob, maxEdge);
+            console.timeEnd('[Worker] downscale step '+maxEdge);
+          }catch(e){ lastErr=e; continue; }
         }
-        // Pad 12px to prevent edge clipping (hand at border)
         try{
           padInfo=await padBlob(input, 12);
           input=padInfo.blob;
         }catch{}
         for(const model of modelOrder){
+          let tLoad=0, tInf=0;
           try{
-            // 60s per model on 4G — allow 40MB quint8 download + WASM inference on throttled CPU
+            console.time('[Worker] inference '+model+' @'+(maxEdge||leBase));
+            memLog('before inference '+model);
             const timeout = new Promise((_,rej)=> setTimeout(()=> rej(new Error('Model timeout after 60s')), 60000));
             const run = fn(input,{
               model,
               output:{format:'image/png', quality:0.92},
               progress:(k,c,t)=>{
                 if(typeof c==='number' && typeof t==='number' && t>0){
-                  const pct=Math.max(5, Math.min(95, Math.round((c as number)/(t as number)*100)));
+                  const pct=Math.max(5, Math.min(95, Math.round(c/t*100)));
                   progressSend(pct,'Downloading… '+pct+'%');
                 } else {
-                  progressSend(null,'Removing background');
+                  // do not send fake pct — honest spinner
                 }
               }
             });
             const res=await Promise.race([run, timeout]);
+            console.timeEnd('[Worker] inference '+model+' @'+(maxEdge||leBase));
+            memLog('after inference '+model);
             let b=res instanceof Blob?res:new Blob([res],{type:'image/png'});
             if(!b || b.size<2000) throw new Error('Empty result');
             if(padInfo && padInfo.w){
               try{ b=await unpadBlob(b, padInfo.pad, padInfo.w, padInfo.h); }catch{}
             }
+            // quick transparency check on small thumb (no large loops)
             try{
               const bmp=await createImageBitmap(b);
               const c=new OffscreenCanvas(Math.min(bmp.width,64), Math.min(bmp.height,64));
               const ctx=c.getContext('2d'); ctx.drawImage(bmp,0,0,c.width,c.height);
               const d=ctx.getImageData(0,0,c.width,c.height).data;
               let tr=0; for(let i=3;i<d.length;i+=4) if(d[i]<250) tr++;
-              bmp.close();
+              bmp.close(); c.width=1; c.height=1;
               if(tr/(d.length/4) < 0.02) throw new Error('No transparency produced');
             }catch(ve){ if(String(ve.message).includes('No transparency')) throw ve; }
-            outBlob=b; lastErr=null; break;
+            // Success — return without large per-pixel loops (mask already applied by imgly)
+            console.log('[Worker] success', model, 'edge', maxEdge||leBase, 'size', b.size);
+            // drop refs
+            input=null; padInfo=null;
+            return { blob: b, rawMaskBlob: null };
           }catch(err){
             const msg=err?.message||String(err);
-            if(isOOM(err)){ progressSend(null,'Out of memory at '+(maxEdge||'1024px')+', retrying smaller…'); lastErr=err; break; }
-            if(String(msg).includes('timeout')){ progressSend(null,'Timeout on '+model+', trying next…'); lastErr=err; continue; }
+            console.warn('[Worker] fail', model, '@'+(maxEdge||leBase), msg);
+            if(isOOM(err)){ lastErr=err; break; } // retry smaller size
+            if(String(msg).includes('timeout')){ lastErr=err; continue; }
             if(String(msg).includes('No transparency')){ lastErr=err; break; }
             lastErr=err; continue;
+          } finally {
+            // release per-iteration
+            try{ if(input && input!==baseBlob) { /* blob GC */ } }catch{}
           }
         }
-        if(outBlob) break;
+        if(lastErr && isOOM(lastErr)) continue; // try next smaller size
       }
-      if(!outBlob) throw lastErr||new Error('All Fast models failed');
-      return { blob: outBlob, rawMaskBlob: null };
+      throw lastErr||new Error('All models failed at capped size');
     }
 
     self.onmessage=async(e)=>{
-      const {id, blob, quality}=e.data;
-      const q=quality==='fast' ? 'fast' : 'high';
-      const send=(m)=>self.postMessage({id, ...m});
+      const {id, blob, cappedEdge}=e.data;
+      const send=(m)=>{
+        try{ self.postMessage({id, ...m}); }catch(err){ try{ self.postMessage({id, type:'error', error: String(err)});}catch{} }
+      };
+      const progressSend=(pct,msg)=> send({type:'progress', pct, msg});
+      let tAll=performance.now();
       try{
+        console.time('[Worker] total');
+        memLog('onmessage start');
         if(!(blob instanceof Blob) || blob.size===0) throw new Error('Invalid image');
-        send({type:'progress', pct:5, msg:'Preparing image…'});
+        send({type:'progress', pct:null, msg:'Removing background, this can take up to a minute on phones'});
         if(await hasTransparency(blob)){
-          send({type:'progress', pct:null, msg:'Preserving transparency…'});
+          progressSend(null,'Removing background, this can take up to a minute on phones');
+          let bmp=null;
           try{
-            const bmp=await createImageBitmap(blob);
+            bmp=await createImageBitmap(blob);
             const c=new OffscreenCanvas(bmp.width,bmp.height);
             const ctx=c.getContext('2d'); ctx.drawImage(bmp,0,0);
             const out=await c.convertToBlob({type:'image/png'});
-            bmp.close(); send({type:'done', blob:out, rawMaskBlob:null}); return;
-          }catch{ send({type:'done', blob:blob, rawMaskBlob:null}); return; }
-        }
-        if(q==='high'){
-          try{
-            send({type:'progress', pct:10, msg:'Loading BiRefNet lite…'});
-            const timeoutPromise=new Promise((_,rej)=> setTimeout(()=> rej(new Error('Timeout after 90s')), 90000));
-            const res=await Promise.race([runBiRefNet(blob, (pct,msg)=> send({type:'progress', pct, msg})), timeoutPromise]);
-            send({type:'progress', pct:null, msg:'Finalizing…'});
-            send({type:'done', blob:res.blob, rawMaskBlob:res.rawMaskBlob, device: res.device, modelId: res.modelId});
+            bmp.close(); bmp=null;
+            c.width=1; c.height=1;
+            const ab=await out.arrayBuffer();
+            // transfer buffer
+            send({type:'done', blob:out, buffer:ab});
+            // also send via transfer
+            try{ self.postMessage({id, type:'done', buffer:ab}, [ab]); }catch{}
             return;
-          }catch(err){
-            const msg=err?.message||String(err);
-            const isTimeout=msg.includes('Timeout');
-            if(isOOM(err) || isTimeout){
-              send({type:'progress', pct:50, msg: (isTimeout?'Timed out after 90s, ':'') + 'Falling back to Fast…'});
-            }else{
-              send({type:'progress', pct:50, msg:'BiRefNet failed, fallback to Fast…'});
-            }
-            console.warn('[BiRefNet] fallback to Fast due to', msg);
-            try{
-              const res2=await runImglyFast(blob, (pct,m)=> send({type:'progress', pct, msg:m}), 'fast');
-              send({type:'progress', pct:null, msg:'Fallback done (Fast)'});
-              send({type:'done', blob:res2.blob, rawMaskBlob:null, fallback:true, fallbackReason: msg});
-              return;
-            }catch(e2){
-              throw new Error('High failed: '+msg+' | Fast also failed: '+(e2?.message||e2));
-            }
-          }
-        }else{
-          send({type:'progress', pct:15, msg:'Loading Fast model…'});
-          const res=await runImglyFast(blob, (pct,m)=> send({type:'progress', pct, msg:m}), 'fast');
-          send({type:'done', blob:res.blob, rawMaskBlob:null});
-          return;
+          }catch{ try{ bmp && bmp.close(); }catch{} send({type:'done', blob:blob}); return; }
         }
+        // Cap is enforced in main thread, but also here
+        const cap = cappedEdge||1024;
+        console.log('[Worker] cappedEdge', cap, 'blob', blob.size, blob.type);
+        const res=await runImglyCapped(blob, progressSend, cap);
+        memLog('before done');
+        console.timeEnd('[Worker] total');
+        console.log('[Worker] total ms', Math.round(performance.now()-tAll));
+        // Use transfer for buffer when possible
+        try{
+          const ab=await res.blob.arrayBuffer();
+          send({type:'done', blob:res.blob, buffer:ab});
+          // attempt transfer
+          try{ self.postMessage({id, type:'done', buffer:ab}, [ab]); }catch{}
+        }catch{
+          send({type:'done', blob:res.blob});
+        }
+        // drop
+        blob.arrayBuffer && blob.arrayBuffer().then(()=>{}).catch(()=>{});
       }catch(err){
-        const detail = (err?.stack||err?.message||String(err)).slice(0,900);
+        console.timeEnd('[Worker] total');
+        const detail=(err?.stack||err?.message||String(err)).slice(0,1200);
         console.error('[Worker] fatal', detail);
+        memLog('on error');
         send({type:'error', error: detail});
+      } finally {
+        // encourage GC
+        try{ if(blob) blob=null; }catch{}
       }
     };
   `;
   const blob = new Blob([code], { type: "application/javascript" });
-  const url = URL.createObjectURL(blob);
-  return new Worker(url, { type: "module" });
+  workerUrl = URL.createObjectURL(blob);
+  const w = new Worker(workerUrl, { type: "module" });
+  // surface worker errors to console
+  w.addEventListener('error', (e)=> console.error('[Main] worker error', e.message, e.filename, e.lineno));
+  w.addEventListener('messageerror', (e)=> console.error('[Main] worker messageerror', e));
+  return w;
 }
 
 export function getWorker(): Worker {
@@ -475,17 +313,37 @@ export function getWorker(): Worker {
   return workerInstance;
 }
 
+export function terminateWorker(){
+  try{
+    if(workerInstance){
+      workerInstance.terminate();
+      workerInstance=null;
+    }
+    if(workerUrl){
+      try{ URL.revokeObjectURL(workerUrl); }catch{}
+      workerUrl=null;
+    }
+  }catch{}
+}
+
+export function recreateWorker(): Worker {
+  terminateWorker();
+  return getWorker();
+}
+
 export async function removeBackgroundViaWorker(
   fileOrBlob: Blob,
   onProgress: ProgressCb,
   signal?: AbortSignal,
-  quality: Quality = "high"
+  quality: Quality = "high",
+  cappedEdge?: number
 ): Promise<Blob> {
   if (!(fileOrBlob instanceof Blob)) throw new Error("Invalid image blob");
   if (fileOrBlob.size === 0) throw new Error("Empty file");
   const t = (fileOrBlob as File).type || "";
   if (t && !t.startsWith("image/")) throw new Error("Invalid type: " + t);
 
+  // fast transparency check on main (small) to avoid worker altogether
   try {
     const bmp = await createImageBitmap(fileOrBlob);
     const w = Math.min(bmp.width, 64), h = Math.min(bmp.height, 64);
@@ -494,51 +352,88 @@ export async function removeBackgroundViaWorker(
     const d=ctx.getImageData(0,0,w,h).data;
     let tr=0; for(let i=3;i<d.length;i+=4) if(d[i]<250) tr++;
     bmp.close();
+    c.width=1; c.height=1;
     if(tr/(d.length/4)>0.08){
-      onProgress(95,"Preserving transparency…");
+      onProgress(null,"Removing background, this can take up to a minute on phones");
       const full=await createImageBitmap(fileOrBlob);
       const cc=document.createElement("canvas"); cc.width=full.width; cc.height=full.height;
       cc.getContext("2d")!.drawImage(full,0,0); full.close();
-      return await new Promise<Blob>((res,rej)=> cc.toBlob(b=> b?res(b):rej(new Error("toBlob failed")),"image/png"));
+      // use toBlob via Offscreen if possible, but keep simple
+      const blob: Blob = await new Promise<Blob>((res,rej)=> cc.toBlob(b=> b?res(b):rej(new Error("toBlob failed")),"image/png"));
+      cc.width=1; cc.height=1;
+      return blob;
     }
   }catch{}
 
   const worker=getWorker();
+  const cap = cappedEdge || getCappedEdge();
   return await new Promise<Blob>((resolve,reject)=>{
     const id=Math.random().toString(36).slice(2);
+    let settled=false;
     const onMessage=(e:MessageEvent)=>{
       if(e.data.id!==id) return;
-      if(e.data.type==="progress") onProgress(e.data.pct as number | null, e.data.msg);
+      if(e.data.type==="progress"){
+        // honest: only download has pct, otherwise indeterminate
+        onProgress(e.data.pct as number | null, e.data.msg);
+      }
       else if(e.data.type==="done"){
+        if(settled) return;
+        settled=true;
         cleanup();
         if(e.data.rawMaskBlob){
           try{ (globalThis as any).__erasebgRawMaskBlob = e.data.rawMaskBlob; }catch{}
-          try{ window.dispatchEvent(new CustomEvent('erasebg-rawmask', {detail:e.data.rawMaskBlob})); }catch{}
         }
-        if(e.data.fallback){
-          try{ onProgress(null, "Used Fast fallback — High failed on this device"); }catch{}
-        }
-        resolve(e.data.blob as Blob);
+        // prefer blob, fallback to buffer
+        if(e.data.blob) resolve(e.data.blob as Blob);
+        else if(e.data.buffer) resolve(new Blob([e.data.buffer],{type:'image/png'}));
+        else reject(new Error("No result"));
       }
-      else if(e.data.type==="error"){ cleanup(); reject(new Error(e.data.error||"Failed")); }
+      else if(e.data.type==="error"){
+        if(settled) return;
+        settled=true;
+        cleanup();
+        reject(new Error(e.data.error||"Failed"));
+      }
     };
     const onError=(err:ErrorEvent)=>{
+      if(settled) return;
+      settled=true;
       cleanup();
       const detail = (err as any)?.message || (err as any)?.filename ? ((err as any).message + " @ " + (err as any).filename + ":" + (err as any).lineno) : "";
-      const msg = (err as any)?.error?.message || detail || "Worker error — WASM crashed (likely OOM). Try a smaller image or crop.";
-      console.error("[Worker] error event", err);
+      const msg = (err as any)?.error?.message || detail || "Worker crashed (likely out of memory).";
+      console.error("[Main] worker error event", err);
       reject(new Error(msg));
+    };
+    const onMessageError=(e:MessageEvent)=>{
+      if(settled) return;
+      settled=true;
+      cleanup();
+      reject(new Error("Worker messageerror — data too large to transfer."));
     };
     const cleanup=()=>{
       worker.removeEventListener("message",onMessage);
       worker.removeEventListener("error",onError);
+      worker.removeEventListener("messageerror",onMessageError);
       if(signal) signal.removeEventListener("abort",onAbort);
     };
-    const onAbort=()=>{ cleanup(); reject(new DOMException("Aborted","AbortError")); };
+    const onAbort=()=>{
+      if(settled) return;
+      settled=true;
+      cleanup();
+      reject(new DOMException("Aborted","AbortError"));
+    };
     worker.addEventListener("message",onMessage);
     worker.addEventListener("error",onError);
+    worker.addEventListener("messageerror",onMessageError as any);
     if(signal) signal.addEventListener("abort",onAbort);
-    worker.postMessage({id, blob:fileOrBlob, quality});
+    // Transfer the blob's buffer if possible? Blob is not transferable, but we can send blob directly (structured clone)
+    // For capped size, blob is at most ~2-3MB, clone is fine.
+    try{
+      worker.postMessage({id, blob:fileOrBlob, cappedEdge: cap, quality});
+    }catch(err){
+      cleanup();
+      reject(new Error("postMessage failed: "+(err as any)?.message));
+    }
   });
 }
 
@@ -550,3 +445,5 @@ export function markModelCached(){ try{localStorage.setItem("erasebg-model-cache
 export function getLastRawMaskBlob(): Blob | null {
   try{ return (globalThis as any).__erasebgRawMaskBlob || null; }catch{ return null; }
 }
+
+export function getCappedEdgeExport(): number { return getCappedEdge(); }
