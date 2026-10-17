@@ -748,7 +748,7 @@ export default function EditorPage(){
               {processing && (
                 <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 bg-ink text-white dark:bg-white dark:text-ink px-3 py-1.5 rounded-full text-xs font-medium flex items-center gap-2 shadow-md max-w-[90%] border border-white/10">
                   <span className="w-3 h-3 border-2 border-white/30 border-t-white dark:border-ink/30 dark:border-t-ink rounded-full animate-spin shrink-0"/>
-                  <span className="truncate font-medium">{progressMsg?.startsWith('Downloading') ? progressMsg : 'Removing background'}</span>
+                  <span className="truncate font-medium">{progressMsg || 'Removing background'}</span>
                   {progressMsg?.startsWith('Downloading') && <span className="bg-white text-ink dark:bg-ink dark:text-white px-2 py-0.5 rounded-full text-xs font-extrabold">{progress}%</span>}
                   <button onClick={()=> abortRef.current?.abort()} className="ml-1 px-2 py-0.5 rounded-full bg-white/15 text-white text-[11px] hover:bg-white/25 shrink-0">Cancel</button>
                 </div>
@@ -887,7 +887,7 @@ export default function EditorPage(){
                   ) : (
                     <div className="flex items-center gap-2 text-xs font-medium">
                       <span className="w-4 h-4 border-2 border-violet/30 border-t-violet rounded-full animate-spin shrink-0"/>
-                      <span>Removing background</span>
+                      <span>{progressMsg || 'Removing background'}</span>
                     </div>
                   )}
                   <button onClick={()=> abortRef.current?.abort()} className="mt-3 text-xs px-3 py-1.5 rounded-full border border-zinc-200 dark:border-white/10 bg-white dark:bg-dark-surface hover:bg-zinc-50 text-ink/70 dark:text-white/70">Cancel</button>

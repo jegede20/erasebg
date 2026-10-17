@@ -345,7 +345,7 @@ function createWorker(): Worker {
         bmp0.close();
         if(le0>1024){
           baseBlob=await downscaleBlob(blob, 1024);
-          progressSend(null,'Removing background');
+          progressSend(null,'Optimized large image to 1024px for speed…');
         }
       }catch{}
       const sizeSteps=[null,768,512];
@@ -353,7 +353,7 @@ function createWorker(): Worker {
         let input=baseBlob;
         let padInfo=null;
         if(maxEdge!==null){
-          try{ input=await downscaleBlob(baseBlob, maxEdge); progressSend(null,'Removing background'); }catch{}
+          try{ input=await downscaleBlob(baseBlob, maxEdge); progressSend(null,'Retrying at '+maxEdge+'px…'); }catch{}
         }
         // Pad 12px to prevent edge clipping (hand at border)
         try{
@@ -394,8 +394,8 @@ function createWorker(): Worker {
             outBlob=b; lastErr=null; break;
           }catch(err){
             const msg=err?.message||String(err);
-            if(isOOM(err)){ progressSend(null,'Removing background'); lastErr=err; break; }
-            if(String(msg).includes('timeout')){ progressSend(null,'Removing background'); lastErr=err; continue; }
+            if(isOOM(err)){ progressSend(null,'Out of memory at '+(maxEdge||'1024px')+', retrying smaller…'); lastErr=err; break; }
+            if(String(msg).includes('timeout')){ progressSend(null,'Timeout on '+model+', trying next…'); lastErr=err; continue; }
             if(String(msg).includes('No transparency')){ lastErr=err; break; }
             lastErr=err; continue;
           }
@@ -412,9 +412,9 @@ function createWorker(): Worker {
       const send=(m)=>self.postMessage({id, ...m});
       try{
         if(!(blob instanceof Blob) || blob.size===0) throw new Error('Invalid image');
-        send({type:'progress', pct:null, msg:'Removing background'});
+        send({type:'progress', pct:5, msg:'Preparing image…'});
         if(await hasTransparency(blob)){
-          send({type:'progress', pct:null, msg:'Removing background'});
+          send({type:'progress', pct:null, msg:'Preserving transparency…'});
           try{
             const bmp=await createImageBitmap(blob);
             const c=new OffscreenCanvas(bmp.width,bmp.height);
@@ -425,17 +425,24 @@ function createWorker(): Worker {
         }
         if(q==='high'){
           try{
-            send({type:'progress', pct:null, msg:'Removing background'});
+            send({type:'progress', pct:10, msg:'Loading BiRefNet lite…'});
             const timeoutPromise=new Promise((_,rej)=> setTimeout(()=> rej(new Error('Timeout after 90s')), 90000));
-            const res=await Promise.race([runBiRefNet(blob, (pct,msg)=> send({type:'progress', pct:null, msg:'Removing background'})), timeoutPromise]);
-            send({type:'progress', pct:null, msg:'Removing background'});
+            const res=await Promise.race([runBiRefNet(blob, (pct,msg)=> send({type:'progress', pct, msg})), timeoutPromise]);
+            send({type:'progress', pct:null, msg:'Finalizing…'});
             send({type:'done', blob:res.blob, rawMaskBlob:res.rawMaskBlob, device: res.device, modelId: res.modelId});
             return;
           }catch(err){
             const msg=err?.message||String(err);
+            const isTimeout=msg.includes('Timeout');
+            if(isOOM(err) || isTimeout){
+              send({type:'progress', pct:50, msg: (isTimeout?'Timed out after 90s, ':'') + 'Falling back to Fast…'});
+            }else{
+              send({type:'progress', pct:50, msg:'BiRefNet failed, fallback to Fast…'});
+            }
             console.warn('[BiRefNet] fallback to Fast due to', msg);
             try{
-              const res2=await runImglyFast(blob, (pct,m)=> send({type:'progress', pct:null, msg:'Removing background'}), 'fast');
+              const res2=await runImglyFast(blob, (pct,m)=> send({type:'progress', pct, msg:m}), 'fast');
+              send({type:'progress', pct:null, msg:'Fallback done (Fast)'});
               send({type:'done', blob:res2.blob, rawMaskBlob:null, fallback:true, fallbackReason: msg});
               return;
             }catch(e2){
@@ -443,8 +450,8 @@ function createWorker(): Worker {
             }
           }
         }else{
-          send({type:'progress', pct:null, msg:'Removing background'});
-          const res=await runImglyFast(blob, (pct,m)=> send({type:'progress', pct:null, msg:'Removing background'}), 'fast');
+          send({type:'progress', pct:15, msg:'Loading Fast model…'});
+          const res=await runImglyFast(blob, (pct,m)=> send({type:'progress', pct, msg:m}), 'fast');
           send({type:'done', blob:res.blob, rawMaskBlob:null});
           return;
         }
