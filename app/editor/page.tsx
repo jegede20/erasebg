@@ -150,18 +150,22 @@ export default function EditorPage(){
     const msgRef = { current: "Removing background" } as { current: string };
     // keep msgRef in sync via wrapper
     const origSetMsg = setProgressMsg;
-    // start ticker that nudges progress 4→90 while worker is silent
+    // start ticker that nudges progress 4→99 while worker is silent (caps at 99 until done)
+    let ticks = 0;
     fakeInt = window.setInterval(()=>{
       if(ac.signal.aborted) return;
-      // don't fake while real download is happening (download will push pct)
+      ticks++;
       if(msgRef.current.startsWith('Downloading')) return;
       setProgress(prev=>{
-        if(prev >= 90) return prev;
-        // quick at start, slower near 90
+        if(prev >= 99) return 99;
+        if(prev >= 90) return Math.min(99, prev + 0.6); // crawl 90→99
         const step = prev < 15 ? 4 : prev < 40 ? 3 : prev < 70 ? 2 : 1;
-        const next = Math.min(90, prev + step);
-        return next;
+        const next = Math.min(99, prev + step);
+        return Math.round(next*10)/10;
       });
+      // after ~45s at 90%+, nudge message so user knows it's still alive
+      if(ticks === 60) setProgressMsg("Still working… finalizing on this device");
+      if(ticks === 90) setProgressMsg("Almost there… hang tight");
     }, 750);
     try {
       // Fast path: downscale any large image to 1024px max (isnet input is 1024) — makes large images seconds, not minutes
@@ -189,10 +193,10 @@ export default function EditorPage(){
           }
         }
       }catch{}
-      // 60s overall timeout so any image finishes within minutes, never hangs
-      const timeoutMs = 60000;
+      // 120s overall timeout — isnet WASM 1024 can be 45-75s on phones, allow retries to 768/512
+      const timeoutMs = 120000;
       const timeoutPromise = new Promise<never>((_,rej)=> {
-        const id=setTimeout(()=> rej(new Error('Timed out — please try again.')), timeoutMs);
+        const id=setTimeout(()=> rej(new Error('Timed out after 120s — tap Cancel and try Re-run with a smaller image or crop.')), timeoutMs);
         ac.signal.addEventListener('abort', ()=> { clearTimeout(id); rej(new DOMException('Aborted','AbortError')); });
       });
       const blob: Blob = prepareBlob;

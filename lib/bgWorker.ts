@@ -362,8 +362,8 @@ function createWorker(): Worker {
         }catch{}
         for(const model of modelOrder){
           try{
-            // 30s timeout per model attempt so UI never hangs forever
-            const timeout = new Promise((_,rej)=> setTimeout(()=> rej(new Error('Model timeout after 30s')), 30000));
+            // 45s per model — 1024 full can be 35s on slow phones, allow download+inference
+            const timeout = new Promise((_,rej)=> setTimeout(()=> rej(new Error('Model timeout after 45s')), 45000));
             const run = fn(input,{
               model,
               output:{format:'image/png', quality:0.92},
