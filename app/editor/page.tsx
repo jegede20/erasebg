@@ -74,6 +74,7 @@ export default function EditorPage(){
   const [rawMaskUrl, setRawMaskUrl] = useState<string|null>(null);
   const [showRawMask, setShowRawMask] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  const hasAutoStartedRef = useRef(false);
 
   useEffect(()=>{
     try{ console.log('[Editor] Fast mode (single message), crossOriginIsolated:', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown'); }catch{}
@@ -168,15 +169,17 @@ export default function EditorPage(){
       if(ticks === 90) setProgressMsg("Almost there… hang tight");
     }, 750);
     try {
-      // Fast path: downscale any large image to 1024px max (isnet input is 1024) — makes large images seconds, not minutes
+      // Fast path: adaptive downscale — 1024 on desktop, 768 on low-end Android (saves 2x WASM time, still clean)
+      const isLowEnd = typeof navigator !== 'undefined' && (((navigator as any).hardwareConcurrency||8) <= 4 || ((navigator as any).deviceMemory && (navigator as any).deviceMemory <= 4) || /Android/i.test(navigator.userAgent));
+      const targetEdge = isLowEnd ? 768 : 1024;
       let prepareBlob: Blob = file;
       try{
         const bmp=await createImageBitmap(file);
         const le=Math.max(bmp.width,bmp.height);
         bmp.close();
-        if(le>1024){
+        if(le>targetEdge){
           const c=document.createElement('canvas');
-          const scale=1024/le;
+          const scale=targetEdge/le;
           const tmp=await createImageBitmap(file);
           const w=Math.round(tmp.width*scale), h=Math.round(tmp.height*scale);
           tmp.close();
@@ -188,7 +191,7 @@ export default function EditorPage(){
           b2.close();
           const blob:Blob|null=await new Promise(r=> c.toBlob(b=> r(b), 'image/png', 0.92));
           if(blob) {
-            console.log('[Editor] pre-downscaled', file.size, '->', blob.size, w+'x'+h);
+            console.log('[Editor] pre-downscaled', file.size, '->', blob.size, w+'x'+h, 'target', targetEdge, 'lowEnd', isLowEnd);
             prepareBlob=blob;
           }
         }
@@ -275,15 +278,19 @@ export default function EditorPage(){
     }
   }, [setResult, quality]);
 
-  // when currentUrl changes and no result, auto start
+  // when currentUrl changes and no result, auto start — guarded to avoid loop after error/timeout
   useEffect(()=>{
-    if (currentUrl && !resultUrl && currentFile && !processing){
+    if (currentUrl && !resultUrl && currentFile && !processing && !error && !hasAutoStartedRef.current){
+      hasAutoStartedRef.current = true;
       startRemoval(currentFile, currentUrl);
     }
-  }, [currentUrl, resultUrl, currentFile, processing, startRemoval]);
+    if (!currentUrl || resultUrl) hasAutoStartedRef.current = false;
+    if (error) hasAutoStartedRef.current = true; // block auto-retry on failure — require manual Re-run
+  }, [currentUrl, resultUrl, currentFile, processing, error, startRemoval]);
 
   // handle file from uploader directly
   const handleFile = (file: File) => {
+    hasAutoStartedRef.current = true; // prevent duplicate useEffect trigger
     const url = URL.createObjectURL(file);
     // revoke previous result to free memory
     if (resultUrl && resultUrl.startsWith("blob:")) try { URL.revokeObjectURL(resultUrl); } catch {}
@@ -926,6 +933,12 @@ export default function EditorPage(){
                     <p className="text-xs text-ink/60 dark:text-white/60 mt-1">Clean isnet (WASM) — no leftover background, no cropping. No data left your device.</p>
                     <button onClick={()=> currentFile && currentUrl && startRemoval(currentFile, currentUrl)} className="mt-2 text-xs font-semibold text-violet hover:underline">Run again</button>
                   </div>
+                </div>
+              ) : error ? (
+                <div className="bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/20 rounded-2xl p-4">
+                  <p className="text-sm font-semibold text-red-700 dark:text-red-300">Failed • {error}</p>
+                  <p className="text-xs text-red-600 dark:text-red-300/80 mt-1 leading-relaxed">Try a smaller image, crop closer to the subject, or charge your phone — low CPU/battery slows WASM. Tap below to retry.</p>
+                  <button onClick={()=> { setError(null); hasAutoStartedRef.current=false; if(currentFile && currentUrl) startRemoval(currentFile, currentUrl); }} className="mt-3 inline-flex items-center gap-1.5 bg-red-600 text-white px-4 py-2 rounded-full text-xs font-semibold hover:bg-red-700">Try again</button>
                 </div>
               ) : (
                 <div className="rounded-2xl border-2 border-dashed border-zinc-200 dark:border-white/10 p-4 text-center">
