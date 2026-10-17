@@ -179,10 +179,9 @@ export default function EditorPage(){
       });
       const blob: Blob = prepareBlob;
       let outBlob = await Promise.race([
-        removeBackgroundViaWorker(blob, (pct, msg)=>{
+        removeBackgroundViaWorker(blob, (pct)=>{
           if(ac.signal.aborted) return;
           if(pct !== null && typeof pct === 'number') setProgress(pct);
-          if(msg) setProgressMsg(msg);
           if(pct !== null && pct >30) markModelCached();
         }, ac.signal, quality),
         timeoutPromise
@@ -745,8 +744,8 @@ export default function EditorPage(){
               {processing && (
                 <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 bg-ink text-white dark:bg-white dark:text-ink px-3 py-1.5 rounded-full text-xs font-medium flex items-center gap-2 shadow-md max-w-[90%] border border-white/10">
                   <span className="w-3 h-3 border-2 border-white/30 border-t-white dark:border-ink/30 dark:border-t-ink rounded-full animate-spin shrink-0"/>
-                  <span className="truncate font-medium">{progressMsg?.startsWith('Downloading') ? progressMsg : 'Removing background'}</span>
-                  {progressMsg?.startsWith('Downloading') && <span className="bg-white text-ink dark:bg-ink dark:text-white px-2 py-0.5 rounded-full text-xs font-extrabold">{progress}%</span>}
+                  <span className="truncate font-medium">Removing background</span>
+                  {progress > 0 && <span className="bg-white text-ink dark:bg-ink dark:text-white px-2 py-0.5 rounded-full text-xs font-extrabold">{progress}%</span>}
                   <button onClick={()=> abortRef.current?.abort()} className="ml-1 px-2 py-0.5 rounded-full bg-white/15 text-white text-[11px] hover:bg-white/25 shrink-0">Cancel</button>
                 </div>
               )}
@@ -871,16 +870,15 @@ export default function EditorPage(){
               <p className="text-xs text-ink/50 dark:text-white/50 leading-relaxed bg-violet/5 dark:bg-violet/10 rounded-xl p-3 border border-violet/15">Clean model: <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">isnet</code> (~80 MB full / 40 MB quint8 fallback, @imgly, WASM, cached after first load) — best quality, no leftover background, no subject cropping.</p>
               {processing ? (
                 <div className="bg-violet/5 dark:bg-violet/10 rounded-2xl p-4 border border-violet/15">
-                  {progressMsg?.startsWith('Downloading') ? (
+                  {progress > 0 ? (
                     <>
                       <div className="flex items-center justify-between text-xs font-bold mb-2">
-                        <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-violet animate-pulse shrink-0"/>Downloading</span>
+                        <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-violet animate-pulse shrink-0"/>Removing background</span>
                         <span className="text-violet text-sm font-extrabold">{progress}%</span>
                       </div>
                       <div className="h-2.5 bg-black/5 dark:bg-white/10 rounded-full overflow-hidden border border-black/5 dark:border-white/5">
                         <div className="h-full bg-violet transition-all duration-300" style={{width:`${progress}%`}}/>
                       </div>
-                      <p className="text-[11px] text-ink/60 dark:text-white/60 mt-1.5 text-center">{progressMsg}</p>
                     </>
                   ) : (
                     <div className="flex items-center gap-2 text-xs font-medium">
