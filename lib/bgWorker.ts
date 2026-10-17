@@ -368,7 +368,13 @@ function createWorker(): Worker {
               model,
               output:{format:'image/png', quality:0.92},
               progress:(k,c,t)=>{
-                progressSend(null,'Removing background');
+                const isDownload = String(k).toLowerCase().includes('model');
+                if(isDownload){
+                  const pct=20+Math.round((c as number)/(t as number)*60);
+                  progressSend(pct,'Downloading… '+pct+'%');
+                } else {
+                  progressSend(null,'Removing background');
+                }
               }
             });
             const res=await Promise.race([run, timeout]);

@@ -181,6 +181,9 @@ export default function EditorPage(){
       let outBlob = await Promise.race([
         removeBackgroundViaWorker(blob, (pct, msg)=>{
           if(ac.signal.aborted) return;
+          if(pct !== null && typeof pct === 'number') setProgress(pct);
+          if(msg) setProgressMsg(msg);
+          if(pct !== null && pct >30) markModelCached();
         }, ac.signal, quality),
         timeoutPromise
       ]) as Blob;
@@ -742,7 +745,8 @@ export default function EditorPage(){
               {processing && (
                 <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 bg-ink text-white dark:bg-white dark:text-ink px-4 py-1.5 rounded-full text-xs font-medium flex items-center gap-2 shadow-md max-w-[90%]">
                   <span className="w-3 h-3 border-2 border-white/30 border-t-white dark:border-ink/30 dark:border-t-ink rounded-full animate-spin shrink-0"/>
-                  <span className="truncate">Removing background</span>
+                  <span className="truncate">{progressMsg?.startsWith('Downloading') ? progressMsg : 'Removing background'}</span>
+                  {progressMsg?.startsWith('Downloading') && <span className="text-[11px] opacity-80">{progress}%</span>}
                   <button onClick={()=> abortRef.current?.abort()} className="ml-1 px-2 py-0.5 rounded-full bg-white/15 text-white text-[11px] hover:bg-white/25">Cancel</button>
                 </div>
               )}
@@ -867,10 +871,17 @@ export default function EditorPage(){
               <p className="text-xs text-ink/50 dark:text-white/50 leading-relaxed bg-violet/5 dark:bg-violet/10 rounded-xl p-3 border border-violet/15">Clean model: <code className="px-1 py-0.5 rounded bg-zinc-50 dark:bg-white/10">isnet</code> (~80 MB full / 40 MB quint8 fallback, @imgly, WASM, cached after first load) — best quality, no leftover background, no subject cropping.</p>
               {processing ? (
                 <div className="bg-violet/5 dark:bg-violet/10 rounded-2xl p-4 border border-violet/15">
-                  <div className="flex items-center gap-2 text-xs font-medium">
-                    <span className="w-4 h-4 border-2 border-violet/30 border-t-violet rounded-full animate-spin shrink-0"/>
-                    <span>Removing background</span>
-                  </div>
+                  {progressMsg?.startsWith('Downloading') ? (
+                    <>
+                      <div className="flex items-center justify-between text-xs font-medium mb-2"><span>{progressMsg}</span><span>{progress}%</span></div>
+                      <div className="h-2 bg-black/5 dark:bg-white/10 rounded-full overflow-hidden"><div className="h-full bg-violet transition-all" style={{width:`${progress}%`}}/></div>
+                    </>
+                  ) : (
+                    <div className="flex items-center gap-2 text-xs font-medium">
+                      <span className="w-4 h-4 border-2 border-violet/30 border-t-violet rounded-full animate-spin shrink-0"/>
+                      <span>Removing background</span>
+                    </div>
+                  )}
                   <button onClick={()=> abortRef.current?.abort()} className="mt-3 text-xs px-3 py-1.5 rounded-full border border-zinc-200 dark:border-white/10 bg-white dark:bg-dark-surface hover:bg-zinc-50 text-ink/70 dark:text-white/70">Cancel</button>
                   {firstTime && <p className="text-xs mt-2 bg-white dark:bg-dark-surface border border-zinc-200 dark:border-white/10 rounded-xl px-2.5 py-2 text-ink/60 dark:text-white/60">First time may take a moment to prepare. Cached for offline after.</p>}
                 </div>
