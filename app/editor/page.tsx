@@ -125,8 +125,8 @@ export default function EditorPage(){
     ctx.putImageData(img, 0, 0);
     return c.toDataURL("image/png");
   };
-  // file -> processing
-  const startRemoval = useCallback(async (file: File, url: string) => {
+  // file -> processing — attempt 0 = 512 first-try, attempt 1 = 384 ultra-low retry
+  const startRemoval = useCallback(async (file: File, url: string, attempt = 0) => {
     if (!(file instanceof Blob)) {
       setError("Invalid file — please re-upload the original image.");
       return;
@@ -139,8 +139,8 @@ export default function EditorPage(){
     try{ abortRef.current?.abort(); }catch{}
     setError(null);
     setProcessing(true);
-    setProgress(4);
-    setProgressMsg("Removing background");
+    setProgress(attempt===1?14:4);
+    setProgressMsg(attempt===1?"Retrying light 384px — second try":"Removing background");
     setFirstTime(isFirstTime());
     const tStart=performance.now();
     console.log('[Editor] startRemoval', file.name, file.size, 'quality', quality);
@@ -148,11 +148,12 @@ export default function EditorPage(){
     abortRef.current=ac;
     // Fake climbing progress so 0% never sticks — real Downloading pct will override
     let fakeInt: number | null = null;
-    const msgRef = { current: "Removing background" } as { current: string };
+    const msgRef = { current: attempt===1?"Retrying light 384px — second try":"Removing background" } as { current: string };
     // keep msgRef in sync via wrapper
     const origSetMsg = setProgressMsg;
     // start ticker that nudges progress 4→99 while worker is silent (caps at 99 until done)
     let ticks = 0;
+    let willRetry = false;
     fakeInt = window.setInterval(()=>{
       if(ac.signal.aborted) return;
       ticks++;
@@ -169,12 +170,13 @@ export default function EditorPage(){
       if(ticks === 90) setProgressMsg("Almost there… hang tight");
     }, 750);
     try {
-      // Fast path: adaptive downscale — 1024 desktop, 768 low-end, 512 very-low (battery/CPU throttled phones)
+      // Fast path: adaptive — Lagos 4G low-battery Android needs 512 first-try to avoid WASM OOM
       const mem = (typeof navigator !== 'undefined' ? ((navigator as any).deviceMemory||8) : 8);
       const cores = (typeof navigator !== 'undefined' ? (navigator.hardwareConcurrency||8) : 8);
-      const veryLow = mem <= 3 || cores <= 2;
-      const isLowEnd = mem <= 4 || cores <= 4 || /Android/i.test(typeof navigator !== 'undefined' ? navigator.userAgent : '');
-      const targetEdge = veryLow ? 512 : isLowEnd ? 768 : 1024;
+      const isAndroid = typeof navigator !== 'undefined' ? /Android/i.test(navigator.userAgent) : false;
+      const veryLow = mem <= 3 || cores <= 2 || isAndroid; // treat any Android on 4G as very-low for first-try success
+      const isLowEnd = veryLow || mem <= 4 || cores <= 4;
+      const targetEdge = attempt === 1 ? 384 : veryLow ? 512 : isLowEnd ? 768 : 1024;
       let prepareBlob: Blob = file;
       try{
         const bmp=await createImageBitmap(file);
@@ -269,15 +271,30 @@ export default function EditorPage(){
       if(fakeInt) { clearInterval(fakeInt); fakeInt = null; }
       if(e?.name==='AbortError'){
         setError("Cancelled");
+      } else if(attempt===0){
+        console.warn('[Editor] first attempt failed, auto-retry ultra-light 384', e);
+        willRetry=true;
+        setProgressMsg("First try failed — retrying light 384px…");
+        setProgress(12);
+        hasAutoStartedRef.current=false;
+        setTimeout(()=> {
+          setError(null);
+          hasAutoStartedRef.current=false;
+          startRemoval(file, url, 1);
+        }, 700);
       } else {
         console.error('[Editor] failed', e);
-        setError(e.message || "Failed to remove background. Try Fast mode or a smaller image.");
+        setError(e.message || "Failed to remove background. Try a smaller image or crop.");
       }
     } finally {
       if(fakeInt) { clearInterval(fakeInt); }
-      setProcessing(false);
-      abortRef.current=null;
-      console.log('[Editor] end total', Math.round(performance.now()-tStart)+'ms');
+      if(!willRetry){
+        setProcessing(false);
+        abortRef.current=null;
+      } else {
+        abortRef.current=null;
+      }
+      console.log('[Editor] end total', Math.round(performance.now()-tStart)+'ms', 'attempt', attempt, 'willRetry', willRetry);
     }
   }, [setResult, quality]);
 
