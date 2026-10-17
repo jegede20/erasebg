@@ -169,9 +169,12 @@ export default function EditorPage(){
       if(ticks === 90) setProgressMsg("Almost there… hang tight");
     }, 750);
     try {
-      // Fast path: adaptive downscale — 1024 on desktop, 768 on low-end Android (saves 2x WASM time, still clean)
-      const isLowEnd = typeof navigator !== 'undefined' && (((navigator as any).hardwareConcurrency||8) <= 4 || ((navigator as any).deviceMemory && (navigator as any).deviceMemory <= 4) || /Android/i.test(navigator.userAgent));
-      const targetEdge = isLowEnd ? 768 : 1024;
+      // Fast path: adaptive downscale — 1024 desktop, 768 low-end, 512 very-low (battery/CPU throttled phones)
+      const mem = (typeof navigator !== 'undefined' ? ((navigator as any).deviceMemory||8) : 8);
+      const cores = (typeof navigator !== 'undefined' ? (navigator.hardwareConcurrency||8) : 8);
+      const veryLow = mem <= 3 || cores <= 2;
+      const isLowEnd = mem <= 4 || cores <= 4 || /Android/i.test(typeof navigator !== 'undefined' ? navigator.userAgent : '');
+      const targetEdge = veryLow ? 512 : isLowEnd ? 768 : 1024;
       let prepareBlob: Blob = file;
       try{
         const bmp=await createImageBitmap(file);

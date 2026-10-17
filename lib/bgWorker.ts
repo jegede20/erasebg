@@ -20,11 +20,13 @@ function createWorker(): Worker {
     let currentModelId = null;
     let removeBackgroundFn = null;
     let loadPromise = null;
+    self.onerror = function(e){ try{ const m=e.message||e.error?.message||String(e); self.postMessage({type:'error', error:m.slice(0,900)}); }catch{} };
+    self.onunhandledrejection = function(e){ try{ const m=e.reason?.message||String(e.reason||e); self.postMessage({type:'error', error:m.slice(0,900)}); }catch{} };
 
     async function loadImgly(){
       if(removeBackgroundFn) return removeBackgroundFn;
       if(loadPromise) return loadPromise;
-      const importWithTimeout=(url, ms=8000)=> Promise.race([import(url), new Promise((_,rej)=> setTimeout(()=> rej(new Error('import timeout')), ms))]);
+      const importWithTimeout=(url, ms=15000)=> Promise.race([import(url), new Promise((_,rej)=> setTimeout(()=> rej(new Error('import timeout '+url)), ms))]);
       loadPromise=(async()=>{
         const urls=[
           'https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.7.0/+esm',
@@ -34,7 +36,7 @@ function createWorker(): Worker {
         ];
         for(const u of urls){
           try{
-            const mod=await importWithTimeout(u, 8000);
+            const mod=await importWithTimeout(u, 15000);
             const fn=mod.removeBackground||mod.default?.removeBackground||mod.default;
             if(fn){ removeBackgroundFn=fn; return fn; }
           }catch(e){}
@@ -146,7 +148,7 @@ function createWorker(): Worker {
 
     function isOOM(err){
       const m=(err?.message||String(err)).toLowerCase();
-      return m.includes('memory')||m.includes('oom')||m.includes('allocation')||m.includes('out of memory')||m.includes('aborted')||m.includes('exceed');
+      return m.includes('memory')||m.includes('oom')||m.includes('allocation')||m.includes('out of memory')||m.includes('aborted')||m.includes('exceed')||m.includes('runtimeerror')||m.includes('wasm')||m.includes('failed to allocate');
     }
     async function hasTransparency(blob){
       try{
@@ -333,11 +335,11 @@ function createWorker(): Worker {
 
     async function runImglyFast(blob, progressSend, quality){
       const fn=await loadImgly();
-      if(!fn) throw new Error('Fast model unavailable');
+      if(!fn) throw new Error('Fast model unavailable — CDN blocked, try on Wi-Fi or VPN');
       // FASTEST: quint8 22MB smallest/fastest, fp16 43MB, isnet 85MB — any image within seconds
       const modelOrder = ['isnet_quint8','isnet_fp16','isnet'];
       let lastErr=null, outBlob=null;
-      // Any image >1024 is downscaled to 1024 before model — isnet input is 1024, so 1024 is enough for quality and makes large images fast
+      // Adaptive downscale: 768 on low-end already done in editor, but keep 1024 cap here for desktop
       let baseBlob = blob;
       try{
         const bmp0=await createImageBitmap(blob);
@@ -348,7 +350,7 @@ function createWorker(): Worker {
           progressSend(null,'Optimized large image to 1024px for speed…');
         }
       }catch{}
-      const sizeSteps=[null,768,512];
+      const sizeSteps=[null,768,512,384];
       for(const maxEdge of sizeSteps){
         let input=baseBlob;
         let padInfo=null;
@@ -362,8 +364,8 @@ function createWorker(): Worker {
         }catch{}
         for(const model of modelOrder){
           try{
-            // 45s per model — 1024 full can be 35s on slow phones, allow download+inference
-            const timeout = new Promise((_,rej)=> setTimeout(()=> rej(new Error('Model timeout after 45s')), 45000));
+            // 60s per model on 4G — allow 40MB quint8 download + WASM inference on throttled CPU
+            const timeout = new Promise((_,rej)=> setTimeout(()=> rej(new Error('Model timeout after 60s')), 60000));
             const run = fn(input,{
               model,
               output:{format:'image/png', quality:0.92},
@@ -456,7 +458,9 @@ function createWorker(): Worker {
           return;
         }
       }catch(err){
-        send({type:'error', error: err?.message||String(err)});
+        const detail = (err?.stack||err?.message||String(err)).slice(0,900);
+        console.error('[Worker] fatal', detail);
+        send({type:'error', error: detail});
       }
     };
   `;
@@ -518,7 +522,13 @@ export async function removeBackgroundViaWorker(
       }
       else if(e.data.type==="error"){ cleanup(); reject(new Error(e.data.error||"Failed")); }
     };
-    const onError=(err:ErrorEvent)=>{ cleanup(); reject(err.error||new Error("Worker error")); };
+    const onError=(err:ErrorEvent)=>{
+      cleanup();
+      const detail = (err as any)?.message || (err as any)?.filename ? ((err as any).message + " @ " + (err as any).filename + ":" + (err as any).lineno) : "";
+      const msg = (err as any)?.error?.message || detail || "Worker error — WASM crashed (likely OOM). Try a smaller image or crop.";
+      console.error("[Worker] error event", err);
+      reject(new Error(msg));
+    };
     const cleanup=()=>{
       worker.removeEventListener("message",onMessage);
       worker.removeEventListener("error",onError);
