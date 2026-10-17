@@ -61,6 +61,140 @@ function createWorker(): Worker {
       return m.includes('memory')||m.includes('oom')||m.includes('allocation')||m.includes('out of memory')||m.includes('aborted')||m.includes('exceed')||m.includes('runtimeerror')||m.includes('wasm')||m.includes('failed to allocate')||m.includes('cannot allocate');
     }
 
+    // BiRefNet for Objects mode — general purpose, MIT, ~94 MB fp16 / 224 MB fp32 (lite)
+    let transformersMod=null, birefProcessor=null, birefModel=null, birefDevice=null, birefDtype=null, currentModelId=null;
+    async function loadTransformers(){
+      if(transformersMod) return transformersMod;
+      const importWithTimeout=(url, ms=15000)=> Promise.race([import(url), new Promise((_,rej)=> setTimeout(()=> rej(new Error('import timeout '+url)), ms))]);
+      const urls=[
+        'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.1/+esm',
+        'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.0/+esm',
+        'https://unpkg.com/@huggingface/transformers@3.7.1/+esm'
+      ];
+      for(const u of urls){
+        try{
+          const mod=await importWithTimeout(u, 15000);
+          if(mod.env && mod.AutoModel && mod.AutoProcessor && mod.RawImage){
+            try{
+              mod.env.allowRemoteModels=true; mod.env.allowLocalModels=false; mod.env.useBrowserCache=true;
+              const isIsolated = typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : false;
+              if(mod.env.backends?.onnx?.wasm){
+                if(isIsolated){ mod.env.backends.onnx.wasm.numThreads=Math.min(4, (navigator.hardwareConcurrency||4)); mod.env.backends.onnx.wasm.simd=true; } else mod.env.backends.onnx.wasm.numThreads=1;
+                mod.env.backends.onnx.wasm.wasmPaths='https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0-dev.20250409-89f8206ba4/dist/';
+              }
+            }catch{}
+            transformersMod=mod; return mod;
+          }
+        }catch(e){}
+      }
+      throw new Error('Failed to load transformers for Objects mode');
+    }
+    function hasWebGPU(){ try{ if(typeof navigator!=='undefined' && (navigator as any).gpu) return true; if(typeof self!=='undefined' && (self as any).navigator?.gpu) return true; }catch{} return false; }
+    async function ensureBiRefNet(progressSend){
+      if(birefModel && birefProcessor) return {processor:birefProcessor, model:birefModel};
+      const mod=await loadTransformers();
+      const {AutoModel, AutoProcessor}=mod;
+      const useWebGPU=hasWebGPU();
+      const modelId = useWebGPU ? 'onnx-community/BiRefNet_lite' : 'onnx-community/BiRefNet_lite-ONNX';
+      const attempts = useWebGPU ? [{device:'webgpu', dtype:'fp32', label:'WebGPU fp32 1024'}, {device:'webgpu', dtype:'fp16', label:'WebGPU fp16 1024'}] : [{device:'wasm', dtype:'fp32', label:'WASM fp32 1024'}, {device:'wasm', dtype:'fp16', label:'WASM fp16 1024'}, {device:'wasm', dtype:'q8', label:'WASM q8 1024'}];
+      let lastErr=null;
+      for(const att of attempts){
+        try{
+          console.time('[BiRefNet] load '+modelId+' '+att.label);
+          progressSend(null,'Removing background, this can take up to a minute on phones');
+          const progress_callback=(data)=>{ try{ if(data.status==='progress' && data.file){ const pct=Math.round(data.progress||0); progressSend(pct,'Downloading… '+pct+'%'); } }catch{} };
+          const processor=await AutoProcessor.from_pretrained(modelId, {progress_callback});
+          const model=await AutoModel.from_pretrained(modelId, {device:att.device, dtype:att.dtype, progress_callback});
+          console.timeEnd('[BiRefNet] load '+modelId+' '+att.label);
+          birefProcessor=processor; birefModel=model; birefDevice=att.device; birefDtype=att.dtype; currentModelId=modelId;
+          return {processor, model};
+        }catch(e){ lastErr=e; console.warn('[BiRefNet] fail', att.label, e?.message||e); continue; }
+      }
+      throw lastErr||new Error('BiRefNet lite failed to load');
+    }
+    async function runBiRefNet(blob, progressSend, cappedEdge){
+      const mod=await loadTransformers();
+      const {RawImage}=mod;
+      const {processor, model}=await ensureBiRefNet(progressSend);
+      if(await hasTransparency(blob)){
+        progressSend(null,'Removing background, this can take up to a minute on phones');
+        let bmp=null;
+        try{
+          bmp=await createImageBitmap(blob);
+          const c=new OffscreenCanvas(bmp.width,bmp.height);
+          const ctx=c.getContext('2d'); ctx.drawImage(bmp,0,0);
+          const out=await c.convertToBlob({type:'image/png'});
+          bmp.close(); c.width=1; c.height=1;
+          return {blob:out, rawMaskBlob:null};
+        }catch{ try{ bmp&&bmp.close(); }catch{} return {blob, rawMaskBlob:null}; }
+      }
+      console.time('[BiRefNet] preprocess');
+      progressSend(null,'Removing background, this can take up to a minute on phones');
+      const image=await RawImage.fromBlob(blob);
+      const fullBmp=await createImageBitmap(blob);
+      const fullW=fullBmp.width, fullH=fullBmp.height;
+      let pixel_values;
+      try{ const out=await processor(image); pixel_values=out.pixel_values||out.input_image||out[Object.keys(out)[0]]; }catch(e){ throw new Error('Preprocess failed: '+(e?.message||e)); }
+      if(!pixel_values) throw new Error('Processor returned no pixel_values');
+      console.timeEnd('[BiRefNet] preprocess');
+      console.time('[BiRefNet] inference');
+      progressSend(null,'Removing background, this can take up to a minute on phones');
+      let outputs;
+      try{ outputs=await model({input_image:pixel_values}); }catch{ try{ outputs=await model({pixel_values}); }catch{ outputs=await model(pixel_values); } }
+      console.timeEnd('[BiRefNet] inference');
+      console.time('[BiRefNet] postprocess');
+      progressSend(null,'Removing background, this can take up to a minute on phones');
+      let tensor=outputs?.output_image||outputs?.logits||outputs?.pred_masks||outputs?.output||outputs?.[0];
+      if(!tensor){ for(const k of Object.keys(outputs||{})){ const v=outputs[k]; if(v&&v.data&&v.dims){tensor=v;break;} } }
+      if(!tensor) throw new Error('No output tensor');
+      if(Array.isArray(tensor)) tensor=tensor[0];
+      const dims=tensor.dims||tensor.shape;
+      const data=tensor.data;
+      let h=dims[dims.length-2], w=dims[dims.length-1];
+      let flat=data;
+      if(flat.length>h*w) flat=flat.slice(flat.length-h*w);
+      const maskU8=new Uint8Array(h*w);
+      for(let i=0;i<h*w;i++){ const v=flat[i]; const sig=1/(1+Math.exp(-v)); maskU8[i]=Math.round(sig*255); }
+      // Build small alpha mask then bilinear up to capped
+      const smallAlpha=new OffscreenCanvas(w,h);
+      const sctx=smallAlpha.getContext('2d');
+      const sImg=sctx.createImageData(w,h);
+      for(let i=0;i<h*w;i++){ sImg.data[i*4]=255; sImg.data[i*4+1]=255; sImg.data[i*4+2]=255; sImg.data[i*4+3]=maskU8[i]; }
+      sctx.putImageData(sImg,0,0);
+      const fullMask=new OffscreenCanvas(fullW,fullH);
+      const fctx=fullMask.getContext('2d');
+      fctx.imageSmoothingEnabled=true; fctx.imageSmoothingQuality='high';
+      fctx.drawImage(smallAlpha,0,0,w,h,0,0,fullW,fullH);
+      smallAlpha.width=1; smallAlpha.height=1;
+      // Composite original with mask via destination-in (no large loops)
+      const outCanvas=new OffscreenCanvas(fullW,fullH);
+      const octx=outCanvas.getContext('2d');
+      octx.drawImage(fullBmp,0,0);
+      fullBmp.close();
+      octx.globalCompositeOperation='destination-in';
+      octx.drawImage(fullMask,0,0);
+      fullMask.width=1; fullMask.height=1;
+      const outBlob=await outCanvas.convertToBlob({type:'image/png'});
+      outCanvas.width=1; outCanvas.height=1;
+      // raw mask for post-processing: at full size grayscale
+      const rawMaskCanvas=new OffscreenCanvas(fullW,fullH);
+      const rctx=rawMaskCanvas.getContext('2d');
+      rctx.imageSmoothingEnabled=true; rctx.imageSmoothingQuality='high';
+      // need grayscale raw: create from maskU8 small then scale
+      const smallGray=new OffscreenCanvas(w,h);
+      const gctx=smallGray.getContext('2d');
+      const gImg=gctx.createImageData(w,h);
+      for(let i=0;i<h*w;i++){ const v=maskU8[i]; gImg.data[i*4]=v; gImg.data[i*4+1]=v; gImg.data[i*4+2]=v; gImg.data[i*4+3]=255; }
+      gctx.putImageData(gImg,0,0);
+      rctx.drawImage(smallGray,0,0,w,h,0,0,fullW,fullH);
+      smallGray.width=1; smallGray.height=1;
+      const rawMaskBlob=await rawMaskCanvas.convertToBlob({type:'image/png'});
+      rawMaskCanvas.width=1; rawMaskCanvas.height=1;
+      console.timeEnd('[BiRefNet] postprocess');
+      return {blob:outBlob, rawMaskBlob};
+    }
+
+
     async function hasTransparency(blob){
       let bmp=null;
       try{
@@ -239,7 +373,8 @@ function createWorker(): Worker {
     }
 
     self.onmessage=async(e)=>{
-      const {id, blob, cappedEdge}=e.data;
+      const {id, blob, cappedEdge, mode}=e.data;
+      const useObjects = mode==='objects';
       const send=(m)=>{
         try{ self.postMessage({id, ...m}); }catch(err){ try{ self.postMessage({id, type:'error', error: String(err)});}catch{} }
       };
@@ -271,7 +406,14 @@ function createWorker(): Worker {
         // Cap is enforced in main thread, but also here
         const cap = cappedEdge||1024;
         console.log('[Worker] cappedEdge', cap, 'blob', blob.size, blob.type);
-        const res=await runImglyCapped(blob, progressSend, cap);
+        let res;
+        if(useObjects){
+          console.log('[Worker] mode objects — BiRefNet lite');
+          res=await runBiRefNet(blob, progressSend, cap);
+        } else {
+          console.log('[Worker] mode', mode||'people', '— isnet');
+          res=await runImglyCapped(blob, progressSend, cap);
+        }
         memLog('before done');
         console.timeEnd('[Worker] total');
         console.log('[Worker] total ms', Math.round(performance.now()-tAll));
@@ -336,7 +478,8 @@ export async function removeBackgroundViaWorker(
   onProgress: ProgressCb,
   signal?: AbortSignal,
   quality: Quality = "high",
-  cappedEdge?: number
+  cappedEdge?: number,
+  mode: "auto"|"people"|"objects" = "auto"
 ): Promise<Blob> {
   if (!(fileOrBlob instanceof Blob)) throw new Error("Invalid image blob");
   if (fileOrBlob.size === 0) throw new Error("Empty file");
@@ -367,6 +510,7 @@ export async function removeBackgroundViaWorker(
 
   const worker=getWorker();
   const cap = cappedEdge || getCappedEdge();
+  const effMode = mode==="auto" ? "people" : mode; // auto defaults to people for now
   return await new Promise<Blob>((resolve,reject)=>{
     const id=Math.random().toString(36).slice(2);
     let settled=false;
@@ -429,7 +573,7 @@ export async function removeBackgroundViaWorker(
     // Transfer the blob's buffer if possible? Blob is not transferable, but we can send blob directly (structured clone)
     // For capped size, blob is at most ~2-3MB, clone is fine.
     try{
-      worker.postMessage({id, blob:fileOrBlob, cappedEdge: cap, quality});
+      worker.postMessage({id, blob:fileOrBlob, cappedEdge: cap, quality, mode: effMode});
     }catch(err){
       cleanup();
       reject(new Error("postMessage failed: "+(err as any)?.message));

@@ -4,11 +4,13 @@ import Uploader from "@/components/Uploader";
 import { useImage } from "@/components/AppShell";
 import { removeBackgroundViaWorker, isFirstTime, markModelCached, getLastRawMaskBlob, terminateWorker, recreateWorker, getCappedEdgeExport } from "@/lib/bgWorker";
 import { saveRecent } from "@/lib/recentStore";
+import { processMask, processMaskFast, imageDataToMask, maskAlphaToImageData } from "@/lib/maskProcess";
 import ReactCrop, { Crop as CropType, centerCrop, makeAspectCrop } from "react-image-crop";
 import "react-image-crop/dist/ReactCrop.css";
 
 type Tool = "remove" | "background" | "refine" | "crop" | "export";
 type BgType = "transparent" | "color" | "image";
+type Mode = "auto" | "people" | "objects";
 const PRESET_COLORS = ["#FFFFFF","#0F1020","#6C4DFF","#E9E9EF"];
 const EXPORT_PRESETS = {
   Original: null,
@@ -40,7 +42,7 @@ export default function EditorPage(){
   const bgImageRef = useRef<HTMLImageElement|null>(null);
 
   // refine
-  const [brushSize, setBrushSize] = useState(24);
+  const [brushSize, setBrushSize] = useState(36); // large default on mobile
   const [brushMode, setBrushMode] = useState<"erase"|"restore">("erase");
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const maskCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -73,6 +75,11 @@ export default function EditorPage(){
   const quality: "fast" = "fast";
   const [rawMaskUrl, setRawMaskUrl] = useState<string|null>(null);
   const [showRawMask, setShowRawMask] = useState(false);
+  const [mode, setMode] = useState<Mode>("auto");
+  const [keep, setKeep] = useState(50); // 0 Keep less … 100 Keep more
+  const rawMaskRef = useRef<{ mask: Uint8Array, w:number, h:number } | null>(null);
+  const hasWebGPU = typeof navigator !== "undefined" && !!(navigator as any).gpu;
+
   const abortRef = useRef<AbortController | null>(null);
   const hasAutoStartedRef = useRef(false);
 
@@ -219,6 +226,7 @@ export default function EditorPage(){
       capLog('before worker');
       let outBlob: Blob;
       try{
+        const effMode = mode==="auto" ? "people" : mode;
         outBlob = await removeBackgroundViaWorker(blob, (pct, msg)=>{
           if(ac.signal.aborted) return;
           if(msg){
@@ -238,7 +246,7 @@ export default function EditorPage(){
             setProgress(pct);
           }
           if(typeof pct==='number' && pct >30) markModelCached();
-        }, ac.signal, "fast", cappedEdge) as Blob;
+        }, ac.signal, effMode==="objects" ? "high" : "fast", cappedEdge, effMode) as Blob;
       }catch(err:any){
         clearWatchdog();
         // handle worker crash/timeout — terminate and retry once at 1024 lighter
@@ -268,9 +276,75 @@ export default function EditorPage(){
       if(ac.signal.aborted) throw new DOMException('Aborted','AbortError');
       // 3) Release prepareBlob if it was capped (original file kept for Recent thumb)
       if(prepareBlob!==file){
-        // let GC, not revoke — file is original, prepareBlob is temporary
         try{ (prepareBlob as any)=null; }catch{}
       }
+      // 4) Cache raw mask and run post-processing (levels + islands/holes) without rerunning model
+      try{
+        let rawMaskBlobForCache: Blob | null = getLastRawMaskBlob();
+        let rawW = prepW, rawH = prepH;
+        let rawMaskU8: Uint8Array | null = null;
+        if(rawMaskBlobForCache){
+          const bmp = await createImageBitmap(rawMaskBlobForCache);
+          rawW=bmp.width; rawH=bmp.height;
+          const c=document.createElement('canvas'); c.width=rawW; c.height=rawH;
+          const ctx=c.getContext('2d')!; ctx.drawImage(bmp,0,0);
+          const d=ctx.getImageData(0,0,rawW,rawH).data;
+          rawMaskU8=new Uint8Array(rawW*rawH);
+          for(let i=0;i<rawMaskU8.length;i++) rawMaskU8[i]=d[i*4];
+          bmp.close(); c.width=1; c.height=1;
+        } else {
+          const bmp=await createImageBitmap(outBlob);
+          rawW=bmp.width; rawH=bmp.height;
+          const c=document.createElement('canvas'); c.width=rawW; c.height=rawH;
+          const ctx=c.getContext('2d')!; ctx.drawImage(bmp,0,0);
+          const d=ctx.getImageData(0,0,rawW,rawH).data;
+          rawMaskU8=new Uint8Array(rawW*rawH);
+          for(let i=0;i<rawMaskU8.length;i++) rawMaskU8[i]=d[i*4+3];
+          bmp.close(); c.width=1; c.height=1;
+        }
+        if(rawMaskU8){
+          rawMaskRef.current={mask: rawMaskU8, w: rawW, h: rawH};
+          console.log('[Editor] raw mask cached', rawW+'x'+rawH, 'keep', keep);
+          const tMask0=performance.now();
+          const processed = processMask(rawMaskU8, rawW, rawH, keep);
+          console.log('[Editor] mask post-process', Math.round(performance.now()-tMask0)+'ms');
+          const origBmp=await createImageBitmap(blob);
+          const outC=document.createElement('canvas'); outC.width=origBmp.width; outC.height=origBmp.height;
+          const octx=outC.getContext('2d')!;
+          octx.drawImage(origBmp,0,0);
+          const maskImg=maskAlphaToImageData(processed, rawW, rawH);
+          const maskBmp=await createImageBitmap(maskImg);
+          const maskCanvasTmp=document.createElement('canvas'); maskCanvasTmp.width=origBmp.width; maskCanvasTmp.height=origBmp.height;
+          const mctxTmp=maskCanvasTmp.getContext('2d')!;
+          mctxTmp.imageSmoothingEnabled=true; mctxTmp.imageSmoothingQuality='high';
+          mctxTmp.drawImage(maskBmp,0,0,rawW,rawH,0,0,origBmp.width,origBmp.height);
+          maskBmp.close();
+          origBmp.close();
+          octx.globalCompositeOperation='destination-in';
+          octx.drawImage(maskCanvasTmp,0,0);
+          maskCanvasTmp.width=1;
+          const finalBlob: Blob = await new Promise<Blob>((res,rej)=> outC.toBlob(b=> b?res(b):rej(new Error('toBlob failed')),'image/png'));
+          outC.width=1;
+          outBlob = finalBlob;
+          const mc=maskCanvasRef.current;
+          if(mc){
+            mc.width=rawW; mc.height=rawH;
+            const mctx2=mc.getContext('2d')!;
+            const img2=maskAlphaToImageData(processed, rawW, rawH);
+            const tmp=document.createElement('canvas'); tmp.width=rawW; tmp.height=rawH;
+            tmp.getContext('2d')!.putImageData(img2,0,0);
+            mctx2.clearRect(0,0,mc.width,mc.height);
+            mctx2.drawImage(tmp,0,0);
+            try{ const d2=mctx2.getImageData(0,0,mc.width,mc.height); setHistory([d2]); setFuture([]); }catch{}
+          }
+          try{
+            const rawImgData = (()=>{ const im=new ImageData(rawW,rawH); const dd=im.data; for(let i=0;i<rawMaskU8.length;i++){ const v=rawMaskU8[i]; dd[i*4]=v; dd[i*4+1]=v; dd[i*4+2]=v; dd[i*4+3]=255; } return im; })();
+            const c2=document.createElement('canvas'); c2.width=rawW; c2.height=rawH;
+            c2.getContext('2d')!.putImageData(rawImgData,0,0);
+            setRawMaskUrl(c2.toDataURL('image/png'));
+          }catch{}
+        }
+      }catch(e){ console.warn('[Editor] mask post-process failed', e); }
       markModelCached();
       console.time('[Editor] thumb+save');
       // Capture RAW mask (small) for debug — drop large arrays after
@@ -341,7 +415,7 @@ export default function EditorPage(){
       // encourage GC
       try{ if(typeof gc==='function') gc(); }catch{}
     }
-  }, [setResult]);
+  }, [setResult, mode, keep]);
 
   // when currentUrl changes and no result, auto start — guarded to avoid loop after error/timeout
   useEffect(()=>{
@@ -939,6 +1013,7 @@ export default function EditorPage(){
               Download
             </button>
             {hasResult && <button onClick={()=> startRemoval(currentFile!, currentUrl!)} disabled={processing} className="bg-white dark:bg-dark-surface border border-zinc-200 dark:border-white/10 px-4 py-2.5 rounded-full text-sm font-medium hover:bg-zinc-50 dark:hover:bg-white/5 touch-target disabled:opacity-50">Re-run removal</button>}
+            {hasResult && <button onClick={()=> { const nm = mode==='people' ? 'objects' : mode==='objects' ? 'people' : 'objects'; setMode(nm as Mode); setTimeout(()=> { hasAutoStartedRef.current=false; setError(null); startRemoval(currentFile!, currentUrl!); }, 80); }} disabled={processing} className="bg-white dark:bg-dark-surface border border-zinc-200 dark:border-white/10 px-4 py-2.5 rounded-full text-sm font-medium hover:bg-zinc-50 dark:hover:bg-white/5 touch-target disabled:opacity-50">Try another mode</button>}
           </div>
         </div>
       </div>
@@ -971,6 +1046,24 @@ export default function EditorPage(){
             <div className="space-y-4">
               <h3 className="font-heading font-bold">Automatic removal</h3>
               <p className="text-sm text-ink/60 dark:text-white/60 leading-relaxed">Removes the background on your device. Usually takes 10 to 40 seconds on a phone.</p>
+              <div className="space-y-2">
+                <p className="text-sm font-medium">Mode</p>
+                <div className="grid grid-cols-3 gap-2">
+                  {(["auto","people","objects"] as Mode[]).map(m=> (
+                    <button key={m} onClick={()=> setMode(m)} className={`py-2.5 rounded-full text-sm font-medium border capitalize touch-target ${mode===m ? "bg-ink text-white dark:bg-white dark:text-ink border-ink" : "bg-white dark:bg-dark-bg border-zinc-200 dark:border-white/10"}`}>
+                      {m}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-xs text-ink/50 dark:text-white/50 leading-relaxed">
+                  {mode==="people" && "Best for people."}
+                  {mode==="objects" && (hasWebGPU ? "General — food, logos, many subjects (WebGPU)." : "General — food, logos, many subjects. On this device it can take up to a minute.")}
+                  {mode==="auto" && "Auto picks the best for this photo."}
+                </p>
+                {mode==="objects" && !hasWebGPU && (
+                  <p className="text-xs text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/20 rounded-xl p-2">Heads up — this mode downloads ~95–224 MB (MIT licensed BiRefNet lite) and runs slower without WebGPU. First use needs Wi-Fi.</p>
+                )}
+              </div>
               {processing ? (
                 <div className="bg-violet/5 dark:bg-violet/10 rounded-2xl p-4 border border-violet/15">
                   {progressMsg?.startsWith('Downloading') && progress!==null && progress>0 ? (
@@ -998,7 +1091,10 @@ export default function EditorPage(){
                   <div>
                     <p className="text-sm font-semibold">Background removed</p>
                     <p className="text-xs text-ink/60 dark:text-white/60 mt-1">Clean isnet (WASM) — no leftover background, no cropping. No data left your device.</p>
-                    <button onClick={()=> currentFile && currentUrl && startRemoval(currentFile, currentUrl)} className="mt-2 text-xs font-semibold text-violet hover:underline">Run again</button>
+                    <div className="flex gap-3 mt-2">
+                      <button onClick={()=> currentFile && currentUrl && startRemoval(currentFile, currentUrl)} className="text-xs font-semibold text-violet hover:underline">Run again</button>
+                      <button onClick={()=> { const nm = mode==='people' ? 'objects' : mode==='objects' ? 'people' : 'objects'; setMode(nm as Mode); if(currentFile && currentUrl){ hasAutoStartedRef.current=false; setError(null); setTimeout(()=> startRemoval(currentFile, currentUrl), 80); } }} className="text-xs font-semibold text-violet hover:underline">Try another mode</button>
+                    </div>
                   </div>
                 </div>
               ) : error ? (
@@ -1069,6 +1165,87 @@ export default function EditorPage(){
               <div className="flex gap-2">
                 <button onClick={()=> setBrushMode("erase")} className={`flex-1 py-2.5 rounded-full text-sm font-medium border touch-target ${brushMode==="erase" ? "bg-ink text-white dark:bg-white dark:text-ink border-ink dark:border-white" : "bg-white dark:bg-dark-bg border-zinc-200 dark:border-white/10"}`}>Erase</button>
                 <button onClick={()=> setBrushMode("restore")} className={`flex-1 py-2.5 rounded-full text-sm font-medium border touch-target ${brushMode==="restore" ? "bg-ink text-white dark:bg-white dark:text-ink border-ink dark:border-white" : "bg-white dark:bg-dark-bg border-zinc-200 dark:border-white/10"}`}>Restore</button>
+              </div>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-sm font-medium">Keep</label>
+                  <span className="text-xs text-ink/50 dark:text-white/50">{keep < 40 ? "Less" : keep > 60 ? "More" : "Balanced"}</span>
+                </div>
+                <div className="flex items-center gap-3">
+                  <span className="text-xs text-ink/40">Less</span>
+                  <input type="range" min={0} max={100} value={keep} onChange={e=> {
+                    const v=parseInt(e.target.value);
+                    setKeep(v);
+                    if(rawMaskRef.current){
+                      const {mask,w,h}=rawMaskRef.current;
+                      const t0=performance.now();
+                      const fast = processMaskFast(mask,w,h,v);
+                      // update mask canvas with fast levels for live preview
+                      const m=maskCanvasRef.current;
+                      if(m){
+                        const ctx=m.getContext("2d")!;
+                        const img=maskAlphaToImageData(fast,w,h);
+                        // create temp canvas to hold mask then draw to m
+                        const tmp=document.createElement("canvas");
+                        tmp.width=w; tmp.height=h;
+                        tmp.getContext("2d")!.putImageData(img,0,0);
+                        ctx.clearRect(0,0,m.width,m.height);
+                        ctx.drawImage(tmp,0,0);
+                        // need to scale to full size? maskCanvas is at capped size, which matches w/h
+                        renderComposite();
+                      }
+                      console.log('[Mask] keep live', v, Math.round(performance.now()-t0)+'ms');
+                    }
+                  }} onMouseUp={()=>{
+                    // on release, do full clean (islands/holes) for final quality
+                    if(rawMaskRef.current){
+                      const {mask,w,h}=rawMaskRef.current;
+                      const t0=performance.now();
+                      const full = processMask(mask,w,h,keep);
+                      const m=maskCanvasRef.current;
+                      if(m){
+                        const ctx=m.getContext("2d")!;
+                        const img=maskAlphaToImageData(full,w,h);
+                        const tmp=document.createElement("canvas");
+                        tmp.width=w; tmp.height=h;
+                        tmp.getContext("2d")!.putImageData(img,0,0);
+                        ctx.clearRect(0,0,m.width,m.height);
+                        ctx.drawImage(tmp,0,0);
+                        // push to history for undo
+                        try{
+                          const data=ctx.getImageData(0,0,m.width,m.height);
+                          setHistory(hs=> [...hs.slice(-19), data]);
+                          setFuture([]);
+                        }catch{}
+                        renderComposite();
+                      }
+                      console.log('[Mask] keep full', keep, Math.round(performance.now()-t0)+'ms');
+                    }
+                  }} onTouchEnd={()=>{
+                    if(rawMaskRef.current){
+                      const {mask,w,h}=rawMaskRef.current;
+                      const full = processMask(mask,w,h,keep);
+                      const m=maskCanvasRef.current;
+                      if(m){
+                        const ctx=m.getContext("2d")!;
+                        const img=maskAlphaToImageData(full,w,h);
+                        const tmp=document.createElement("canvas");
+                        tmp.width=w; tmp.height=h;
+                        tmp.getContext("2d")!.putImageData(img,0,0);
+                        ctx.clearRect(0,0,m.width,m.height);
+                        ctx.drawImage(tmp,0,0);
+                        try{
+                          const data=ctx.getImageData(0,0,m.width,m.height);
+                          setHistory(hs=> [...hs.slice(-19), data]);
+                          setFuture([]);
+                        }catch{}
+                        renderComposite();
+                      }
+                    }
+                  }} className="flex-1" aria-label="Keep more or less" />
+                  <span className="text-xs text-ink/40">More</span>
+                </div>
+                <p className="text-xs text-ink/50 dark:text-white/50">Shifts the mask curve. No rerun.</p>
               </div>
               <div>
                 <label className="flex items-center justify-between text-sm font-medium">Brush size <span className="text-xs text-ink/50 dark:text-white/50">{brushSize}px</span></label>
