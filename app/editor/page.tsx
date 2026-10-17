@@ -138,13 +138,31 @@ export default function EditorPage(){
     try{ abortRef.current?.abort(); }catch{}
     setError(null);
     setProcessing(true);
-    setProgress(0);
+    setProgress(4);
     setProgressMsg("Removing background");
     setFirstTime(isFirstTime());
     const tStart=performance.now();
     console.log('[Editor] startRemoval', file.name, file.size, 'quality', quality);
     const ac=new AbortController();
     abortRef.current=ac;
+    // Fake climbing progress so 0% never sticks — real Downloading pct will override
+    let fakeInt: number | null = null;
+    const msgRef = { current: "Removing background" } as { current: string };
+    // keep msgRef in sync via wrapper
+    const origSetMsg = setProgressMsg;
+    // start ticker that nudges progress 4→90 while worker is silent
+    fakeInt = window.setInterval(()=>{
+      if(ac.signal.aborted) return;
+      // don't fake while real download is happening (download will push pct)
+      if(msgRef.current.startsWith('Downloading')) return;
+      setProgress(prev=>{
+        if(prev >= 90) return prev;
+        // quick at start, slower near 90
+        const step = prev < 15 ? 4 : prev < 40 ? 3 : prev < 70 ? 2 : 1;
+        const next = Math.min(90, prev + step);
+        return next;
+      });
+    }, 750);
     try {
       // Fast path: downscale any large image to 1024px max (isnet input is 1024) — makes large images seconds, not minutes
       let prepareBlob: Blob = file;
@@ -181,12 +199,17 @@ export default function EditorPage(){
       let outBlob = await Promise.race([
         removeBackgroundViaWorker(blob, (pct, msg)=>{
           if(ac.signal.aborted) return;
-          if(pct !== null && typeof pct === 'number') setProgress(pct);
-          if(msg) setProgressMsg(msg);
+          if(msg) { msgRef.current = msg; setProgressMsg(msg); }
+          if(pct !== null && typeof pct === 'number') {
+            // real download pct overrides fake — jump to at least that value
+            setProgress(prev => Math.max(prev, pct));
+          }
           if(pct !== null && pct >30) markModelCached();
         }, ac.signal, quality),
         timeoutPromise
       ]) as Blob;
+      if(fakeInt) { clearInterval(fakeInt); fakeInt = null; }
+      setProgress(100);
       markModelCached();
       if(ac.signal.aborted) throw new DOMException('Aborted','AbortError');
       console.log('[Editor] done total', Math.round(performance.now()-tStart)+'ms');
@@ -233,14 +256,15 @@ export default function EditorPage(){
       setShowBefore(false);
       setTool("background");
     } catch(e:any){
+      if(fakeInt) { clearInterval(fakeInt); fakeInt = null; }
       if(e?.name==='AbortError'){
         setError("Cancelled");
       } else {
         console.error('[Editor] failed', e);
-        // Auto fallback is handled in worker; if still fails show message and suggest Fast
         setError(e.message || "Failed to remove background. Try Fast mode or a smaller image.");
       }
     } finally {
+      if(fakeInt) { clearInterval(fakeInt); }
       setProcessing(false);
       abortRef.current=null;
       console.log('[Editor] end total', Math.round(performance.now()-tStart)+'ms');
