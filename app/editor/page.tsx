@@ -76,8 +76,16 @@ export default function EditorPage(){
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(()=>{
-    try{ console.log('[Editor] Clean-cut mode (isnet via @imgly, full quality), crossOriginIsolated:', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown'); }catch{}
+    try{ console.log('[Editor] Clean-cut mode (isnet_fp16 via @imgly, balanced quality), crossOriginIsolated:', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown'); }catch{}
   },[]);
+  // If processing hangs >20s, nudge user that large images take longer
+  useEffect(()=>{
+    if(!processing) return;
+    const t=setTimeout(()=> {
+      if(processing) setProgressMsg(m=> m.includes('Still working') ? m : (m||'Removing background…') + ' — Still working… large images take longer. You can Cancel and try a smaller image.');
+    }, 20000);
+    return ()=> clearTimeout(t);
+  },[processing]);
 
   // PIPELINE GUARANTEE: file is ALWAYS the original File/Blob.
   // The checker preview (div.checker + overlayRef/canvasRef + p-5 container) is display ONLY.
@@ -88,6 +96,25 @@ export default function EditorPage(){
     r.onerror = rej;
     r.readAsDataURL(b);
   });
+  const blobToThumbDataUrl = async (b: Blob, maxEdge=800): Promise<string> => {
+    try{
+      const bmp=await createImageBitmap(b);
+      const le=Math.max(bmp.width,bmp.height);
+      if(le<=maxEdge){
+        bmp.close();
+        return await blobToDataUrl(b);
+      }
+      const scale=maxEdge/le;
+      const w=Math.round(bmp.width*scale), h=Math.round(bmp.height*scale);
+      const c=document.createElement('canvas');
+      c.width=w; c.height=h;
+      const ctx=c.getContext('2d')!;
+      ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high';
+      ctx.drawImage(bmp,0,0,w,h);
+      bmp.close();
+      return c.toDataURL('image/png');
+    }catch{ return await blobToDataUrl(b); }
+  };
   const blobToMaskUrl = async (blob: Blob): Promise<string> => {
     const bmp = await createImageBitmap(blob);
     const c = document.createElement("canvas");
@@ -115,6 +142,8 @@ export default function EditorPage(){
       setError("Empty file — please choose another image.");
       return;
     }
+    // Abort any previous job
+    try{ abortRef.current?.abort(); }catch{}
     setError(null);
     setProcessing(true);
     setProgress(0);
@@ -125,18 +154,50 @@ export default function EditorPage(){
     const ac=new AbortController();
     abortRef.current=ac;
     try {
-      // HARD GUARD: use the ORIGINAL File blob directly, never a preview canvas screenshot
-      // High = BiRefNet lite (1024 WebGPU / 512 WASM auto), Fast = @imgly isnet_quint8 fallback
-      // Pipeline: preprocess -> model -> sigmoid -> bilinear resize to ORIGINAL -> alpha (no threshold/blur)
-      const blob: Blob = file;
-      let outBlob = await removeBackgroundViaWorker(blob, (pct, msg)=>{
-        // Real download progress only: pct is number during download, null during inference (indeterminate)
-        if(pct !== null && typeof pct === 'number') setProgress(pct);
-        if (msg) setProgressMsg(msg);
-        if (pct !== null && pct > 30) markModelCached();
-        // Log stages
-        if(msg) console.log('[Editor] progress', pct, msg);
-      }, ac.signal, quality);
+      // Safety: auto-downscale huge images before worker to avoid OOM/hang
+      let prepareBlob: Blob = file;
+      try{
+        const bmp=await createImageBitmap(file);
+        const le=Math.max(bmp.width,bmp.height);
+        bmp.close();
+        if(le>2400){
+          const c=document.createElement('canvas');
+          const scale=2400/le;
+          const tmp=await createImageBitmap(file);
+          const w=Math.round(tmp.width*scale), h=Math.round(tmp.height*scale);
+          tmp.close();
+          const b2=await createImageBitmap(file);
+          c.width=w; c.height=h;
+          const ctx=c.getContext('2d')!;
+          ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high';
+          ctx.drawImage(b2,0,0,w,h);
+          b2.close();
+          const blob:Blob|null=await new Promise(r=> c.toBlob(b=> r(b), 'image/png', 0.92));
+          if(blob) {
+            console.log('[Editor] pre-downscaled', file.size, '->', blob.size, w+'x'+h);
+            setProgressMsg('Optimized large image for speed…');
+            prepareBlob=blob;
+          }
+        }
+      }catch{}
+      // 50s overall timeout so UI never hangs forever
+      const timeoutMs = 50000;
+      const timeoutPromise = new Promise<never>((_,rej)=> {
+        const id=setTimeout(()=> rej(new Error('Timed out after '+(timeoutMs/1000)+'s — try a smaller image or check connection, then Re-run.')), timeoutMs);
+        ac.signal.addEventListener('abort', ()=> { clearTimeout(id); rej(new DOMException('Aborted','AbortError')); });
+      });
+      const blob: Blob = prepareBlob;
+      let outBlob = await Promise.race([
+        removeBackgroundViaWorker(blob, (pct, msg)=>{
+          if(ac.signal.aborted) return;
+          if(pct !== null && typeof pct === 'number') setProgress(pct);
+          if (msg) setProgressMsg(msg);
+          if (pct !== null && pct > 30) markModelCached();
+          if(msg) console.log('[Editor] progress', pct, msg);
+        }, ac.signal, quality),
+        timeoutPromise
+      ]) as Blob;
+      if(ac.signal.aborted) throw new DOMException('Aborted','AbortError');
       console.log('[Editor] done total', Math.round(performance.now()-tStart)+'ms');
       // Capture RAW mask (before compositing) for debug view — prefer worker-provided rawMask (BiRefNet grayscale full-res)
       try {
@@ -152,9 +213,10 @@ export default function EditorPage(){
         setShowRawMask(false);
       } catch {}
       const outUrl = URL.createObjectURL(outBlob);
+      // Use thumbnails for Recent to avoid IndexedDB quota hang (full-res kept for export)
       const [resultDataUrl, originalDataUrl] = await Promise.all([
-        blobToDataUrl(outBlob),
-        blobToDataUrl(file),
+        blobToThumbDataUrl(outBlob, 800),
+        blobToThumbDataUrl(file, 800),
       ]);
       setResult(outUrl);
       // set dimensions
@@ -164,7 +226,7 @@ export default function EditorPage(){
         setOrigH(img.naturalHeight);
         setResizeW(img.naturalWidth);
         setResizeH(img.naturalHeight);
-        // Persist ORIGINAL as dataUrl (not blob: objectURL which dies on reload)
+        // Persist thumbnails for Recent (fast, no quota hang)
         saveRecent({
           id: Date.now().toString(36)+Math.random().toString(36).slice(2,6),
           name: file.name.replace(/\.[^/.]+$/,"") || "image",
@@ -318,82 +380,66 @@ export default function EditorPage(){
   };
 
   const renderComposite = () => {
-    // composite main canvas + mask onto overlay preview? For now overlayRef shows live preview with background
-    // We'll redraw main canvas with mask applied for export preview
-    // This function updates overlay canvas visual
     const main = canvasRef.current;
     const mask = maskCanvasRef.current;
     const overlay = overlayRef.current;
     if (!main || !mask || !overlay) return;
     const w = main.width, h = main.height;
-    overlay.width = w; overlay.height = h;
-    const octx = overlay.getContext("2d")!;
-    octx.clearRect(0,0,w,h);
-    // draw background
-    if (bgType === "color") {
-      octx.fillStyle = bgColor;
-      octx.fillRect(0,0,w,h);
-    } else if (bgType === "image" && bgImageUrl) {
-      const bgImg = bgImageRef.current;
-      if (bgImg && bgImg.complete) {
-        // cover
-        const scale = Math.max(w/bgImg.naturalWidth, h/bgImg.naturalHeight);
-        const sw = bgImg.naturalWidth*scale, sh = bgImg.naturalHeight*scale;
-        octx.drawImage(bgImg, (w-sw)/2, (h-sh)/2, sw, sh);
-      }
+    if (w===0 || h===0) return;
+    // Cap preview to 1024px max dimension for speed — full-res kept for export, preview is display only
+    const maxDisplay = 1024;
+    let dw=w, dh=h;
+    if (Math.max(w,h) > maxDisplay){
+      const s=maxDisplay/Math.max(w,h);
+      dw=Math.round(w*s); dh=Math.round(h*s);
+    }
+    overlay.width=dw; overlay.height=dh;
+    const octx=overlay.getContext("2d")!;
+    octx.clearRect(0,0,dw,dh);
+    // background at display size
+    if (bgType==="color"){
+      octx.fillStyle=bgColor; octx.fillRect(0,0,dw,dh);
+    } else if (bgType==="image" && bgImageUrl && bgImageRef.current?.complete){
+      const bgImg=bgImageRef.current;
+      const scale=Math.max(dw/bgImg.naturalWidth, dh/bgImg.naturalHeight);
+      const sw=bgImg.naturalWidth*scale, sh=bgImg.naturalHeight*scale;
+      octx.drawImage(bgImg, (dw-sw)/2, (dh-sh)/2, sw, sh);
     } else {
-      // checker is CSS, but for canvas we leave transparent; for overlay we draw checker pattern via fill
-      // draw checker
-      const size = 20;
-      octx.fillStyle = "#fff";
-      octx.fillRect(0,0,w,h);
-      octx.fillStyle = "#E9E9EF";
-      for(let y=0;y<h;y+=size){
-        for(let x=0;x<w;x+=size){
-          if ((Math.floor(x/size)+Math.floor(y/size))%2===0) octx.fillRect(x,y,size,size);
+      const size=16;
+      octx.fillStyle="#fff"; octx.fillRect(0,0,dw,dh);
+      octx.fillStyle="#E9E9EF";
+      for(let y=0;y<dh;y+=size){
+        for(let x=0;x<dw;x+=size){
+          if((Math.floor(x/size)+Math.floor(y/size))%2===0) octx.fillRect(x,y,size,size);
         }
       }
     }
-    // draw main image with mask applied: create temp
-    const temp = document.createElement("canvas");
-    temp.width = w; temp.height = h;
-    const tctx = temp.getContext("2d")!;
-    tctx.drawImage(main,0,0);
-    // apply mask: where mask is black, make transparent; white => keep
-    // Use mask's alpha? We drew black/white opaque; we need to use it as eraser
-    // Use globalCompositeOperation destination-out where mask black
-    // Create mask handling: we have mask canvas with black strokes (erase) and white (restore)
-    // We need to apply erasing: set composite destination-out for black pixels
-    // For simplicity, get mask image data and apply per pixel
-    const mctx = mask.getContext("2d")!;
-    const mData = mctx.getImageData(0,0,w,h);
-    const tData = tctx.getImageData(0,0,w,h);
-    const origData = originalImageDataRef.current;
-    // If mask is empty (all transparent), then tData stays as is.
-    let hasMask = false;
-    for(let i=3;i<mData.data.length;i+=4){ if(mData.data[i]!==0){ hasMask=true; break; } }
-    if (hasMask){
-      for(let i=0;i<tData.data.length;i+=4){
-        const a = mData.data[i+3];
-        if (a===0) continue; // no stroke
-        const v = mData.data[i]; // 0 or 255
-        if (v < 128) { // erase
-          tData.data[i+3] = 0;
-        } else { // restore — use original alpha to preserve feathered edges, no white halo
-          if (origData && origData.data.length === tData.data.length) {
-            tData.data[i] = origData.data[i];
-            tData.data[i+1] = origData.data[i+1];
-            tData.data[i+2] = origData.data[i+2];
-            tData.data[i+3] = origData.data[i+3];
-          } else {
-            tData.data[i+3] = 255;
-          }
+    // main scaled to display
+    const temp=document.createElement("canvas");
+    temp.width=dw; temp.height=dh;
+    const tctx=temp.getContext("2d")!;
+    tctx.drawImage(main, 0,0,w,h, 0,0,dw,dh);
+    // mask scaled to display — per-pixel only on 1M max, not 24M full-res
+    const maskScaled=document.createElement("canvas");
+    maskScaled.width=dw; maskScaled.height=dh;
+    const msctx=maskScaled.getContext("2d")!;
+    msctx.drawImage(mask, 0,0,w,h, 0,0,dw,dh);
+    try{
+      const mData=msctx.getImageData(0,0,dw,dh);
+      let hasMask=false;
+      for(let i=3;i<mData.data.length;i+=4) if(mData.data[i]!==0){hasMask=true;break;}
+      if(hasMask){
+        const tData=tctx.getImageData(0,0,dw,dh);
+        for(let i=0;i<tData.data.length;i+=4){
+          const a=mData.data[i+3];
+          if(a===0) continue;
+          const v=mData.data[i];
+          if(v<128) tData.data[i+3]=0; // erase
+          else tData.data[i+3]=255; // restore — opaque (isnet already feathered, no need to copy original)
         }
+        tctx.putImageData(tData,0,0);
       }
-      tctx.putImageData(tData,0,0);
-    }
-    // apply crop if exists?
-    // For preview we handle crop via CSS too; but composite already includes full image
+    }catch{}
     octx.drawImage(temp,0,0);
   };
 
@@ -595,7 +641,7 @@ export default function EditorPage(){
       a.click();
       document.body.removeChild(a);
       setTimeout(()=> { try{ URL.revokeObjectURL(url);}catch{} }, 4000);
-      const dataUrl = await blobToDataUrl(blob);
+      const dataUrl = await blobToThumbDataUrl(blob, 800);
       try {
         const orig = originalUrl || currentUrl || "";
         await saveRecent({

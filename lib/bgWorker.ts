@@ -24,6 +24,7 @@ function createWorker(): Worker {
     async function loadImgly(){
       if(removeBackgroundFn) return removeBackgroundFn;
       if(loadPromise) return loadPromise;
+      const importWithTimeout=(url, ms=8000)=> Promise.race([import(url), new Promise((_,rej)=> setTimeout(()=> rej(new Error('import timeout')), ms))]);
       loadPromise=(async()=>{
         const urls=[
           'https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.7.0/+esm',
@@ -33,7 +34,7 @@ function createWorker(): Worker {
         ];
         for(const u of urls){
           try{
-            const mod=await import(u);
+            const mod=await importWithTimeout(u, 8000);
             const fn=mod.removeBackground||mod.default?.removeBackground||mod.default;
             if(fn){ removeBackgroundFn=fn; return fn; }
           }catch(e){}
@@ -45,6 +46,7 @@ function createWorker(): Worker {
 
     async function loadTransformers(){
       if(transformersMod) return transformersMod;
+      const importWithTimeout=(url, ms=8000)=> Promise.race([import(url), new Promise((_,rej)=> setTimeout(()=> rej(new Error('import timeout')), ms))]);
       const urls=[
         'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.1/+esm',
         'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.0/+esm',
@@ -52,7 +54,7 @@ function createWorker(): Worker {
       ];
       for(const u of urls){
         try{
-          const mod=await import(u);
+          const mod=await importWithTimeout(u, 8000);
           if(mod.env && mod.AutoModel && mod.AutoProcessor && mod.RawImage){
             try{
               mod.env.allowRemoteModels = true;
@@ -293,146 +295,92 @@ function createWorker(): Worker {
       bmp.close();
       return out;
     }
-    // Edge preservation: add transparent padding so subjects at image border aren't clipped, then feather-expand 1-2px to fix flat wrist/bottom cuts
+    // Edge preservation: small transparent padding prevents clipping at image borders (e.g. wrist at bottom)
     async function padBlob(blob, pad){
-      const bmp=await createImageBitmap(blob);
-      const c=new OffscreenCanvas(bmp.width+pad*2, bmp.height+pad*2);
-      const ctx=c.getContext('2d');
-      ctx.clearRect(0,0,c.width,c.height);
-      ctx.drawImage(bmp, pad, pad);
-      const out=await c.convertToBlob({type:'image/png'});
-      const w=bmp.width, h=bmp.height;
-      bmp.close();
-      return {blob:out, w, h, pad};
-    }
-    async function unpadBlob(paddedBlob, pad, origW, origH){
-      const bmp=await createImageBitmap(paddedBlob);
-      const c=new OffscreenCanvas(origW, origH);
-      const ctx=c.getContext('2d');
-      // Handle case where model resized output (should be padded size). Scale then crop.
-      const expectedW = origW + pad*2;
-      const expectedH = origH + pad*2;
-      if(bmp.width===expectedW && bmp.height===expectedH){
-        ctx.drawImage(bmp, -pad, -pad);
-      } else {
-        // Scale to expected padded size then crop
-        const scale = Math.min(bmp.width/expectedW, bmp.height/expectedH);
-        // Draw scaled padded image and offset by pad
-        const drawW = expectedW * scale;
-        const drawH = expectedH * scale;
-        const offX = (bmp.width - drawW)/2;
-        const offY = (bmp.height - drawH)/2;
-        // Extract central orig region
-        ctx.drawImage(bmp, offX + pad*scale, offY + pad*scale, origW*scale, origH*scale, 0, 0, origW, origH);
-      }
-      const out=await c.convertToBlob({type:'image/png'});
-      bmp.close();
-      return out;
-    }
-    async function featherExpandEdge(blob){
-      // Soft 2px dilation to restore flat bottom/wrist cuts — feathered, not hard halo
       try{
         const bmp=await createImageBitmap(blob);
-        const c=new OffscreenCanvas(bmp.width, bmp.height);
+        const c=new OffscreenCanvas(bmp.width+pad*2, bmp.height+pad*2);
         const ctx=c.getContext('2d');
-        ctx.drawImage(bmp,0,0);
-        const img=ctx.getImageData(0,0,c.width,c.height);
-        const d=img.data, w=c.width, h=c.height;
-        const copy=new Uint8Array(d);
-        // 2px radius soft expand: for transparent pixels near opaque, add feathered alpha
-        for(let y=0;y<h;y++){
-          for(let x=0;x<w;x++){
-            const i=(y*w+x)*4;
-            if(d[i+3] > 20) continue; // already opaque/feathered
-            let maxA=0;
-            for(let dy=-2; dy<=2; dy++){
-              for(let dx=-2; dx<=2; dx++){
-                if(dx===0&&dy===0) continue;
-                const nx=x+dx, ny=y+dy;
-                if(nx<0||ny<0||nx>=w||ny>=h) continue;
-                const ni=(ny*w+nx)*4;
-                const a=copy[ni+3];
-                if(a>150){
-                  const dist=Math.sqrt(dx*dx+dy*dy);
-                  const feather = dist<=1 ? 90 : dist<=1.5 ? 55 : 30;
-                  if(feather>maxA) maxA=feather;
-                } else if(a>80){
-                  if(35>maxA) maxA=35;
-                }
-              }
-            }
-            if(maxA>0){
-              // copy color from nearest opaque neighbor
-              let best=null, bestDist=99;
-              for(let dy=-2; dy<=2; dy++){
-                for(let dx=-2; dx<=2; dx++){
-                  const nx=x+dx, ny=y+dy;
-                  if(nx<0||ny<0||nx>=w||ny>=h) continue;
-                  const ni=(ny*w+nx)*4;
-                  if(copy[ni+3]>150){
-                    const dist=Math.abs(dx)+Math.abs(dy);
-                    if(dist<bestDist){ bestDist=dist; best=ni; }
-                  }
-                }
-              }
-              if(best!==null){
-                d[i]=copy[best];
-                d[i+1]=copy[best+1];
-                d[i+2]=copy[best+2];
-                d[i+3]=maxA;
-              }
-            }
-          }
+        ctx.clearRect(0,0,c.width,c.height);
+        ctx.drawImage(bmp, pad, pad);
+        const out=await c.convertToBlob({type:'image/png'});
+        const w=bmp.width, h=bmp.height;
+        bmp.close();
+        return {blob:out, w, h, pad};
+      }catch{ return {blob, w:0, h:0, pad:0}; }
+    }
+    async function unpadBlob(paddedBlob, pad, origW, origH){
+      if(!pad || !origW) return paddedBlob;
+      try{
+        const bmp=await createImageBitmap(paddedBlob);
+        const c=new OffscreenCanvas(origW, origH);
+        const ctx=c.getContext('2d');
+        const expectedW = origW + pad*2;
+        const expectedH = origH + pad*2;
+        if(bmp.width===expectedW && bmp.height===expectedH){
+          ctx.drawImage(bmp, -pad, -pad);
+        } else {
+          // Fallback: center crop / scale to orig
+          const sx = Math.max(0, (bmp.width - origW)/2);
+          const sy = Math.max(0, (bmp.height - origH)/2);
+          ctx.drawImage(bmp, sx, sy, origW, origH, 0, 0, origW, origH);
         }
-        ctx.putImageData(img,0,0);
         const out=await c.convertToBlob({type:'image/png'});
         bmp.close();
         return out;
-      }catch{ return blob; }
+      }catch{ return paddedBlob; }
     }
 
     async function runImglyFast(blob, progressSend, quality){
       const fn=await loadImgly();
       if(!fn) throw new Error('Fast model unavailable');
-      // QUALITY: always try best first — isnet (full) preserves hair/edges without cutting, quint8 is fallback for low RAM
-      const modelOrder = ['isnet','isnet_fp16','isnet_quint8'];
+      // SPEED+QUALITY: fp16 is 43MB good balance, quint8 22MB fastest fallback, isnet 85MB best quality last
+      const modelOrder = ['isnet_fp16','isnet_quint8','isnet'];
       let lastErr=null, outBlob=null;
-      const sizeSteps=[null,2048,1536,1024];
+      // Pre-downscale large images to 2048 to avoid OOM and speed up — isnet input is 1024 anyway
+      let baseBlob = blob;
+      try{
+        const bmp0=await createImageBitmap(blob);
+        const le0=Math.max(bmp0.width,bmp0.height);
+        bmp0.close();
+        if(le0>2048){
+          baseBlob=await downscaleBlob(blob, 2048);
+          progressSend(10,'Optimized large image to 2048px for speed…');
+        }
+      }catch{}
+      const sizeSteps=[null,1536,1024];
       for(const maxEdge of sizeSteps){
-        let input=blob;
+        let input=baseBlob;
         let padInfo=null;
         if(maxEdge!==null){
-          try{ input=await downscaleBlob(blob, maxEdge); progressSend(18,'Retrying at '+maxEdge+'px…'); }catch{}
+          try{ input=await downscaleBlob(baseBlob, maxEdge); progressSend(18,'Retrying at '+maxEdge+'px…'); }catch{}
         }
-        // Pad 16px transparent border to prevent edge clipping (hand at image border)
+        // Pad 12px to prevent edge clipping (hand at border)
         try{
-          const bmpTmp=await createImageBitmap(input);
-          const iw=bmpTmp.width, ih=bmpTmp.height;
-          bmpTmp.close();
-          padInfo=await padBlob(input, 16);
+          padInfo=await padBlob(input, 12);
           input=padInfo.blob;
         }catch{}
         for(const model of modelOrder){
           try{
-            const res=await fn(input,{
+            // 30s timeout per model attempt so UI never hangs forever
+            const timeout = new Promise((_,rej)=> setTimeout(()=> rej(new Error('Model timeout after 30s')), 30000));
+            const run = fn(input,{
               model,
               output:{format:'image/png', quality:0.92},
               progress:(k,c,t)=>{
                 const pct=20+Math.round(c/t*60);
                 const msg=String(k).toLowerCase().includes('model')
-                  ? 'Downloading '+model+'…'
+                  ? 'Downloading '+model+'… '+pct+'%'
                   : 'Segmenting…';
                 progressSend(pct, msg);
               }
             });
+            const res=await Promise.race([run, timeout]);
             let b=res instanceof Blob?res:new Blob([res],{type:'image/png'});
             if(!b || b.size<2000) throw new Error('Empty result');
-            // Unpad to original size before checks
-            if(padInfo){
+            if(padInfo && padInfo.w){
               try{ b=await unpadBlob(b, padInfo.pad, padInfo.w, padInfo.h); }catch{}
             }
-            // Feather expand 1-2px to fix flat cuts (wrist bottom)
-            try{ b=await featherExpandEdge(b); }catch{}
             try{
               const bmp=await createImageBitmap(b);
               const c=new OffscreenCanvas(Math.min(bmp.width,64), Math.min(bmp.height,64));
@@ -445,7 +393,8 @@ function createWorker(): Worker {
             outBlob=b; lastErr=null; break;
           }catch(err){
             const msg=err?.message||String(err);
-            if(isOOM(err)){ progressSend(55,'Out of memory at '+(maxEdge||'full-res')+', retrying smaller…'); lastErr=err; break; }
+            if(isOOM(err)){ progressSend(55,'Out of memory at '+(maxEdge||'2048px')+', retrying smaller…'); lastErr=err; break; }
+            if(String(msg).includes('timeout')){ progressSend(45,'Timeout on '+model+', trying next…'); lastErr=err; continue; }
             if(String(msg).includes('No transparency')){ lastErr=err; break; }
             lastErr=err; continue;
           }
