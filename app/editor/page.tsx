@@ -777,8 +777,8 @@ export default function EditorPage(){
               ) : (
                 // After view
                 !hasResult ? (
-                  <div className="relative w-full h-full flex items-center justify-center">
-                    <img src={currentUrl!} alt="Original" className="w-full h-full object-contain p-2 opacity-30 blur-[1.5px] scale-[0.98]" />
+                  <div className="relative w-full h-full flex items-center justify-center bg-white dark:bg-[#1A1A28]">
+                    <img src={currentUrl!} alt="Original" className="w-full h-full object-contain p-2" />
                   </div>
                 ) : tool==="crop" ? (
                   // crop also applies to result? show crop on result
