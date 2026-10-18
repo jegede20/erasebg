@@ -2,8 +2,9 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import Uploader from "@/components/Uploader";
 import { useImage } from "@/components/AppShell";
-import { removeBackgroundViaWorker, isFirstTime, markModelCached, getLastRawMaskBlob, terminateWorker, recreateWorker, getCappedEdgeExport } from "@/lib/bgWorker";
+import { removeBackgroundViaWorker, isFirstTime, markModelCached, getLastRawMaskBlob, getLastRawMaskData, isWebGPUAvailable, getBirefnetModelInfo, terminateWorker, recreateWorker, getCappedEdgeExport, type BgMode } from "@/lib/bgWorker";
 import { saveRecent } from "@/lib/recentStore";
+import { postProcessRawMask } from "@/lib/maskPostProcess";
 import ReactCrop, { Crop as CropType, centerCrop, makeAspectCrop } from "react-image-crop";
 import "react-image-crop/dist/ReactCrop.css";
 
@@ -13,8 +14,8 @@ const PRESET_COLORS = ["#FFFFFF","#0F1020","#6C4DFF","#E9E9EF"];
 const EXPORT_PRESETS = {
   Original: null,
   Square: { w: 1080, h: 1080 },
-  Passport: { w: 600, h: 750 }, // 35x45mm ratio approx 7:9 at 300dpi simplified
-  Social: { w: 1080, h: 1350 }, // 4:5
+  Passport: { w: 600, h: 750 },
+  Social: { w: 1080, h: 1350 },
 } as const;
 
 function useIsMobile(){
@@ -33,6 +34,12 @@ export default function EditorPage(){
   const [firstTime, setFirstTime] = useState(false);
   const [error, setError] = useState<string|null>(null);
 
+  // mode
+  const [mode, setMode] = useState<BgMode>("auto");
+  const [webGPU, setWebGPU] = useState(false);
+  useEffect(()=>{ setWebGPU(isWebGPUAvailable()); },[]);
+  const modelInfo = getBirefnetModelInfo();
+
   // background
   const [bgType, setBgType] = useState<BgType>("transparent");
   const [bgColor, setBgColor] = useState("#6C4DFF");
@@ -40,7 +47,9 @@ export default function EditorPage(){
   const bgImageRef = useRef<HTMLImageElement|null>(null);
 
   // refine
+  const isMobile = useIsMobile();
   const [brushSize, setBrushSize] = useState(24);
+  useEffect(()=>{ setBrushSize(isMobile ? 36 : 24); },[isMobile]);
   const [brushMode, setBrushMode] = useState<"erase"|"restore">("erase");
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const maskCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -50,6 +59,11 @@ export default function EditorPage(){
   const [future, setFuture] = useState<ImageData[]>([]);
   const isDrawing = useRef(false);
   const lastPos = useRef<{x:number,y:number}|null>(null);
+
+  // mask post-processing
+  const [keepAdjust, setKeepAdjust] = useState(0); // -50 keep less .. +50 keep more, 0 default
+  const rawMaskRef = useRef<{mask:Uint8Array,w:number,h:number}|null>(null);
+  const keepDebounceRef = useRef<number|null>(null);
 
   // crop
   const [crop, setCrop] = useState<CropType>();
@@ -68,7 +82,6 @@ export default function EditorPage(){
   const [exportFormat, setExportFormat] = useState<"png"|"jpg">("png");
   const [exportPreset, setExportPreset] = useState<keyof typeof EXPORT_PRESETS>("Original");
 
-  const isMobile = useIsMobile();
   const [sheetOpen, setSheetOpen] = useState(true);
   const quality: "fast" = "fast";
   const [rawMaskUrl, setRawMaskUrl] = useState<string|null>(null);
@@ -77,12 +90,9 @@ export default function EditorPage(){
   const hasAutoStartedRef = useRef(false);
 
   useEffect(()=>{
-    try{ console.log('[Editor] Fast mode (single message), crossOriginIsolated:', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown'); }catch{}
+    try{ console.log('[Editor] Fast mode, crossOriginIsolated:', typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'unknown'); }catch{}
   },[]);
 
-  // PIPELINE GUARANTEE: file is ALWAYS the original File/Blob.
-  // The checker preview (div.checker + overlayRef/canvasRef + p-5 container) is display ONLY.
-  // Never pass overlayRef/canvasRef/maskCanvasRef/CheckerPreview canvas.toBlob/toDataURL into removeBackgroundViaWorker.
   const blobToDataUrl = (b: Blob) => new Promise<string>((res, rej) => {
     const r = new FileReader();
     r.onload = () => res(r.result as string);
@@ -117,7 +127,6 @@ export default function EditorPage(){
     bmp.close();
     const img = ctx.getImageData(0, 0, c.width, c.height);
     const d = img.data;
-    // Convert alpha to grayscale mask: white=foreground (opaque), black=background (transparent)
     for (let i = 0; i < d.length; i += 4) {
       const a = d[i + 3];
       d[i] = a; d[i+1] = a; d[i+2] = a; d[i+3] = 255;
@@ -125,8 +134,63 @@ export default function EditorPage(){
     ctx.putImageData(img, 0, 0);
     return c.toDataURL("image/png");
   };
-  // file -> processing — capped to 1536 phone / 2048 desktop, honest progress, watchdog 60s
-  const startRemoval = useCallback(async (file: File, url: string, attempt = 0) => {
+
+  // Apply raw mask -> processed -> update canvas, with live preview (no model re-run)
+  const applyKeepAdjustToCanvas = useCallback(async (keep: number, updateUrl:boolean=true)=>{
+    const raw = rawMaskRef.current;
+    const c = canvasRef.current;
+    if(!raw || !c || c.width===0) return;
+    try{
+      console.time("[Mask] post-process keep "+keep);
+      const processed = postProcessRawMask(raw.mask, raw.w, raw.h, keep);
+      console.timeEnd("[Mask] post-process keep "+keep);
+      // update main canvas alpha
+      const ctx=c.getContext("2d")!;
+      // ensure canvas size matches raw dimensions
+      if(c.width!==raw.w || c.height!==raw.h){
+        // shouldn't happen, but handle resize
+      }
+      const imgData = ctx.getImageData(0,0,c.width,c.height);
+      const d=imgData.data;
+      // If canvas was already cropped/masked? Use originalImageData for color? Keep current colors but just replace alpha with processed
+      for(let i=0,p=0;i<d.length;i+=4,p++){
+        // keep RGB as is, replace alpha
+        d[i+3]=processed[p] ?? 0;
+      }
+      ctx.putImageData(imgData,0,0);
+      // store updated original for restore brush to use processed state as baseline
+      try{ originalImageDataRef.current = ctx.getImageData(0,0,c.width,c.height); }catch{}
+      renderComposite();
+      if(updateUrl){
+        // regenerate resultUrl blob for export/share (debounced)
+        try{
+          // revoke old if blob?
+          const newBlob: Blob = await new Promise((res,rej)=> c.toBlob(b=> b?res(b):rej(new Error("toBlob failed")), "image/png") as any);
+          const newUrl = URL.createObjectURL(newBlob);
+          // need to update resultUrl state without re-triggering init effect that would overwrite canvas
+          // So we update directly via setResult but avoid resetting canvas because rawMaskRef persists and init checks for existing data
+          // Temporarily store to avoid re-init: keep originalImageData already set
+          if(resultUrl && resultUrl.startsWith("blob:")) try{ URL.revokeObjectURL(resultUrl);}catch{}
+          setResult(newUrl);
+          // update recent thumb? will be handled on export, not needed now
+        }catch(e){ console.warn("Failed to regenerate blob after keep", e); }
+      }
+    }catch(e){ console.error("keepAdjust failed", e); }
+  },[resultUrl, setResult]);
+
+  // when keepAdjust changes, live preview
+  useEffect(()=>{
+    if(!rawMaskRef.current || !canvasRef.current || !resultUrl) return;
+    // debounce rapid slider moves: immediate preview without URL regen, debounced URL regen
+    if(keepDebounceRef.current) window.clearTimeout(keepDebounceRef.current);
+    // immediate fast path without URL regen
+    applyKeepAdjustToCanvas(keepAdjust, false);
+    keepDebounceRef.current = window.setTimeout(()=>{ applyKeepAdjustToCanvas(keepAdjust, true); }, 350);
+    return ()=>{ if(keepDebounceRef.current) window.clearTimeout(keepDebounceRef.current); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[keepAdjust]);
+
+  const startRemoval = useCallback(async (file: File, url: string, attempt = 0, forcedMode?: BgMode) => {
     const capLog = (tag: string) => {
       try{
         const m = (performance as any).memory;
@@ -149,14 +213,14 @@ export default function EditorPage(){
     setProgressMsg("Removing background, this can take up to a minute on phones");
     setFirstTime(isFirstTime());
     const tStart=performance.now();
-    console.log('[Editor] startRemoval', file.name, file.size, 'attempt', attempt);
+    const activeMode = forcedMode || mode;
+    console.log('[Editor] startRemoval', file.name, file.size, 'attempt', attempt, 'mode', activeMode);
     capLog('start');
     const ac=new AbortController();
     abortRef.current=ac;
     let watchdog: number | null = null;
     let didWatchdogRetry = false;
     const clearWatchdog = ()=> { if(watchdog!==null){ clearTimeout(watchdog); watchdog=null; } };
-    // watchdog 60s — terminate hung worker and retry once at 1024 lighter
     watchdog = window.setTimeout(async ()=>{
       if(ac.signal.aborted) return;
       console.warn('[Editor] watchdog 60s — terminating worker, will retry at 1024');
@@ -166,31 +230,27 @@ export default function EditorPage(){
       if(attempt===0 && !didWatchdogRetry){
         didWatchdogRetry=true;
         clearWatchdog();
-        setProgressMsg("Taking longer than usual — retrying with lighter model at 1024px");
-        // allow UI to show retry
+        setProgressMsg("Removing background, this can take up to a minute on phones");
         setTimeout(()=> {
           hasAutoStartedRef.current=false;
           setError(null);
-          startRemoval(file, url, 1);
+          startRemoval(file, url, 1, activeMode);
         }, 500);
       } else {
-        setError("Still taking a long time on this device. Try a smaller photo or crop closer to the subject.");
+        setError("Background removal timed out. Try a smaller photo or close other apps and try again.");
         setProcessing(false);
       }
     }, 60000);
     ac.signal.addEventListener('abort', clearWatchdog);
     try {
-      // 1) Cap working resolution BEFORE anything else — 1536 phone, 2048 desktop (never 12MP)
       const isPhone = typeof navigator !== "undefined" && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
       const cappedEdge = attempt===1 ? 1024 : (isPhone ? 1536 : 2048);
       let prepareBlob: Blob = file;
-      let prepW=0, prepH=0;
       try{
         console.time('[Editor] cap');
         const bmp=await createImageBitmap(file);
-        prepW=bmp.width; prepH=bmp.height;
         const le=Math.max(bmp.width,bmp.height);
-        console.log('[Editor] original', bmp.width+'x'+bmp.height, 'cappedEdge', cappedEdge, 'attempt', attempt);
+        console.log('[Editor] original', bmp.width+'x'+bmp.height, 'cappedEdge', cappedEdge, 'attempt', attempt, 'mode', activeMode);
         if(le>cappedEdge){
           const scale=cappedEdge/le;
           const w=Math.round(bmp.width*scale), h=Math.round(bmp.height*scale);
@@ -205,7 +265,6 @@ export default function EditorPage(){
           if(blob) {
             console.log('[Editor] capped', file.size, '->', blob.size, w+'x'+h);
             prepareBlob=blob;
-            prepW=w; prepH=h;
           }
         } else {
           bmp.close();
@@ -214,7 +273,6 @@ export default function EditorPage(){
         capLog('after cap');
       }catch(e){ console.warn('[Editor] cap failed', e); }
       const blob: Blob = prepareBlob;
-      // 2) Call worker — honest progress: only Downloading has pct, otherwise spinner
       console.time('[Editor] worker');
       capLog('before worker');
       let outBlob: Blob;
@@ -222,26 +280,19 @@ export default function EditorPage(){
         outBlob = await removeBackgroundViaWorker(blob, (pct, msg)=>{
           if(ac.signal.aborted) return;
           if(msg){
-            // honest: only Downloading shows pct bar, otherwise indeterminate
             if(msg.startsWith('Downloading') && typeof pct==='number'){
               setProgress(pct);
               setProgressMsg(msg);
             } else if(msg.startsWith('Downloading')){
               setProgressMsg(msg);
             } else {
-              // indeterminate stage — keep message honest, no fake %
               setProgressMsg("Removing background, this can take up to a minute on phones");
-              // keep progress at 0 to show spinner, but if pct is download, show it
-              if(typeof pct==='number' && pct>0) setProgress(pct);
             }
-          } else if(typeof pct==='number'){
-            setProgress(pct);
           }
           if(typeof pct==='number' && pct >30) markModelCached();
-        }, ac.signal, "fast", cappedEdge) as Blob;
+        }, ac.signal, "fast", cappedEdge, activeMode) as Blob;
       }catch(err:any){
         clearWatchdog();
-        // handle worker crash/timeout — terminate and retry once at 1024 lighter
         const msg = err?.message||String(err);
         const isWorkerCrash = msg.includes('Worker')||msg.includes('crashed')||msg.includes('OOM')||msg.includes('out of memory')||msg.includes('aborted');
         const isTimeout = msg.includes('timeout')||msg.includes('Timeout');
@@ -249,14 +300,13 @@ export default function EditorPage(){
           console.warn('[Editor] worker failed, retrying at 1024 lighter', msg);
           try{ terminateWorker(); }catch{}
           try{ recreateWorker(); }catch{}
-          // release blob before retry
           try{ if(prepareBlob!==file){ /* let GC */ } }catch{}
-          setProgressMsg("First attempt failed — retrying with lighter model at 1024px");
+          setProgressMsg("Removing background, this can take up to a minute on phones");
           setProgress(0);
           hasAutoStartedRef.current=false;
           setTimeout(()=> {
             setError(null);
-            startRemoval(file, url, 1);
+            startRemoval(file, url, 1, activeMode);
           }, 600);
           return;
         }
@@ -266,30 +316,79 @@ export default function EditorPage(){
       console.timeEnd('[Editor] worker');
       capLog('after worker');
       if(ac.signal.aborted) throw new DOMException('Aborted','AbortError');
-      // 3) Release prepareBlob if it was capped (original file kept for Recent thumb)
       if(prepareBlob!==file){
-        // let GC, not revoke — file is original, prepareBlob is temporary
         try{ (prepareBlob as any)=null; }catch{}
       }
       markModelCached();
-      console.time('[Editor] thumb+save');
-      // Capture RAW mask (small) for debug — drop large arrays after
+      console.time('[Editor] post-process+thumb');
+      // ── Extract raw mask (alpha) before post-processing ──
+      let rawMaskDataUrl: string | null = null;
       try {
-        if (rawMaskUrl && rawMaskUrl.startsWith("blob:")) try{ URL.revokeObjectURL(rawMaskUrl); }catch{}
+        // Prefer mask data from BiRefNet path if available
+        const rawData = getLastRawMaskData();
+        if(rawData){
+          // rawData is already 0-255 mask (BiRefNet direct)
+          // keep it for post-processing? But BiRefNet mask is already raw before levels, we can use it
+          // For People path, we need to extract from outBlob
+          // We'll treat rawData as raw if objects mode, else ignore?
+          // Use blob fallback for consistency
+        }
+        // Extract alpha as raw mask for debug view + post-processing source
+        const bmpTmp = await createImageBitmap(outBlob);
+        const cTmp = document.createElement("canvas");
+        cTmp.width = bmpTmp.width; cTmp.height = bmpTmp.height;
+        const ctxTmp = cTmp.getContext("2d")!;
+        ctxTmp.drawImage(bmpTmp,0,0);
+        bmpTmp.close();
+        const imgTmp = ctxTmp.getImageData(0,0,cTmp.width,cTmp.height);
+        const total = cTmp.width*cTmp.height;
+        const rawMask = new Uint8Array(total);
+        const d=imgTmp.data;
+        for(let i=0,p=0;i<d.length;i+=4,p++) rawMask[p]=d[i+3];
+        // Store raw for slider live preview
+        rawMaskRef.current = { mask: rawMask.slice(), w: cTmp.width, h: cTmp.height };
+        setKeepAdjust(0); // reset slider for new image
+        // Build debug raw mask url (mid-gray visible) BEFORE post-processing
+        const dbgCanvas = document.createElement("canvas");
+        dbgCanvas.width=cTmp.width; dbgCanvas.height=cTmp.height;
+        const dbgCtx=dbgCanvas.getContext("2d")!;
+        const dbgImg = dbgCtx.createImageData(cTmp.width,cTmp.height);
+        for(let i=0,p=0;i<dbgImg.data.length;i+=4,p++){ const v=rawMask[p]; dbgImg.data[i]=v; dbgImg.data[i+1]=v; dbgImg.data[i+2]=v; dbgImg.data[i+3]=255; }
+        dbgCtx.putImageData(dbgImg,0,0);
+        rawMaskDataUrl = dbgCanvas.toDataURL("image/png");
+        // Also check dbgBlob from worker
         const dbgBlob = getLastRawMaskBlob();
-        let rawMaskDataUrl: string;
-        if (dbgBlob) {
-          rawMaskDataUrl = await blobToDataUrl(dbgBlob);
-          // release dbgBlob
-          try{ (dbgBlob as any)=null; }catch{}
-        } else {
-          rawMaskDataUrl = await blobToMaskUrl(outBlob);
+        if(dbgBlob){
+          try{ rawMaskDataUrl = await blobToDataUrl(dbgBlob); }catch{}
         }
         setRawMaskUrl(rawMaskDataUrl);
         setShowRawMask(false);
-      } catch {}
+        console.log("[Mask] raw extracted", cTmp.width+"x"+cTmp.height, "mid-gray check", (()=>{ let mid=0; for(let i=0;i<rawMask.length;i++) if(rawMask[i]>25 && rawMask[i]<230) mid++; return Math.round(mid/rawMask.length*100)+"% mid-gray"; })());
+        // ── Apply smooth levels + islands/holes to get final blob ──
+        console.time("[Mask] post-process initial");
+        const processed = postProcessRawMask(rawMask, cTmp.width, cTmp.height, 0);
+        console.timeEnd("[Mask] post-process initial");
+        // Write processed back to ImageData and create new blob
+        for(let i=0,p=0;i<d.length;i+=4,p++) d[i+3]=processed[p];
+        ctxTmp.putImageData(imgTmp,0,0);
+        const processedBlob: Blob = await new Promise((res,rej)=> cTmp.toBlob(b=> b?res(b):rej(new Error("toBlob failed")), "image/png") as any);
+        cTmp.width=1; cTmp.height=1;
+        dbgCanvas.width=1; dbgCanvas.height=1;
+        // Use processedBlob as final result (if processing succeeded and not all zero)
+        let useBlob = outBlob;
+        try{
+          // verify processed has some foreground
+          let fg=0; for(let i=0;i<processed.length;i++) if(processed[i]>10) fg++;
+          if(fg/(processed.length) > 0.005){
+            useBlob = processedBlob;
+            console.log("[Mask] using processed mask, fg", Math.round(fg/processed.length*100)+"%");
+          } else {
+            console.warn("[Mask] processed mask empty, keeping raw");
+          }
+        }catch{}
+        outBlob = useBlob;
+      } catch(e){ console.warn("raw mask extract / post-process failed", e); try{ setRawMaskUrl(await blobToMaskUrl(outBlob)); }catch{} }
       const outUrl = URL.createObjectURL(outBlob);
-      // Use thumbnails for Recent to avoid IndexedDB quota hang (full-res is capped, not 12MP)
       const [resultDataUrl, originalDataUrl] = await Promise.all([
         blobToThumbDataUrl(outBlob, 800),
         blobToThumbDataUrl(file, 800),
@@ -311,23 +410,22 @@ export default function EditorPage(){
           height: img.naturalHeight,
           size: outBlob.size
         }).catch(()=>{});
-        // release image
         try{ img.src=""; }catch{}
       };
       img.onerror = () => { try{ img.src=""; }catch{} };
       img.src = outUrl;
       setShowBefore(false);
       setTool("background");
-      console.timeEnd('[Editor] thumb+save');
+      console.timeEnd('[Editor] post-process+thumb');
       capLog('done');
-      console.log('[Editor] done total', Math.round(performance.now()-tStart)+'ms', 'cappedEdge', cappedEdge, 'attempt', attempt);
+      console.log('[Editor] done total', Math.round(performance.now()-tStart)+'ms', 'cappedEdge', cappedEdge, 'attempt', attempt, 'mode', activeMode);
     } catch(e:any){
       clearWatchdog();
       if(e?.name==='AbortError'){
-        setError("Cancelled");
+        setError(null);
+        console.log('[Editor] aborted', e?.message||String(e));
       } else {
         console.error('[Editor] failed', e);
-        // clear watchdog worker if crash
         if(String(e?.message).includes('Worker')||String(e?.message).includes('crashed')){
           try{ terminateWorker(); recreateWorker(); }catch{}
         }
@@ -338,30 +436,25 @@ export default function EditorPage(){
       setProcessing(false);
       abortRef.current=null;
       console.log('[Editor] end total', Math.round(performance.now()-tStart)+'ms');
-      // encourage GC
-      try{ if(typeof gc==='function') gc(); }catch{}
+      try{ if(typeof (globalThis as any).gc==='function') (globalThis as any).gc(); }catch{}
     }
-  }, [setResult]);
+  }, [setResult, mode]);
 
-  // when currentUrl changes and no result, auto start — guarded to avoid loop after error/timeout
   useEffect(()=>{
     if (currentUrl && !resultUrl && currentFile && !processing && !error && !hasAutoStartedRef.current){
       hasAutoStartedRef.current = true;
       startRemoval(currentFile, currentUrl);
     }
     if (!currentUrl || resultUrl) hasAutoStartedRef.current = false;
-    if (error) hasAutoStartedRef.current = true; // block auto-retry on failure — require manual Re-run
+    if (error) hasAutoStartedRef.current = true;
   }, [currentUrl, resultUrl, currentFile, processing, error, startRemoval]);
 
-  // handle file from uploader directly
   const handleFile = (file: File) => {
-    hasAutoStartedRef.current = true; // prevent duplicate useEffect trigger
+    hasAutoStartedRef.current = true;
     const url = URL.createObjectURL(file);
-    // revoke previous result to free memory
     if (resultUrl && resultUrl.startsWith("blob:")) try { URL.revokeObjectURL(resultUrl); } catch {}
     if (rawMaskUrl) try { if(rawMaskUrl.startsWith("blob:")) URL.revokeObjectURL(rawMaskUrl); }catch{}
     setCurrent(file, url, url);
-    // reset states
     setBgType("transparent");
     setBgImageUrl(null);
     bgImageRef.current = null;
@@ -370,17 +463,27 @@ export default function EditorPage(){
     setCrop(undefined);
     setCompletedCrop(undefined);
     originalImageDataRef.current = null;
+    rawMaskRef.current=null;
     setRawMaskUrl(null);
     setShowRawMask(false);
+    setKeepAdjust(0);
     setError(null);
     setProgress(0);
     setProgressMsg("Removing background");
-    // Directly start — don't rely solely on useEffect (state is async)
-    setTimeout(()=> startRemoval(file, url), 50);
+    setTimeout(()=> startRemoval(file, url, 0), 50);
   };
 
-  // refine setup: init mask canvas when resultUrl ready + store original for restore
-  // Persistent canvases are now always mounted (outside preview conditional) so they survive tool switches
+  const cycleModeAndRerun = ()=>{
+    const order: BgMode[] = ["auto","people","objects"];
+    const idx = order.indexOf(mode);
+    const next = order[(idx+1)%order.length] as BgMode;
+    setMode(next);
+    // re-run with next mode
+    if(currentFile && currentUrl){
+      setTimeout(()=> startRemoval(currentFile, currentUrl, 0, next), 80);
+    }
+  };
+
   useEffect(()=>{
     if (!resultUrl || !maskCanvasRef.current || !canvasRef.current) return;
     const img = new Image();
@@ -389,7 +492,6 @@ export default function EditorPage(){
       if (!canvasRef.current || !maskCanvasRef.current) return;
       const c = canvasRef.current!;
       const m = maskCanvasRef.current!;
-      // avoid re-init if already correct size and has data
       if (c.width === img.naturalWidth && c.height === img.naturalHeight && originalImageDataRef.current) return;
       c.width = img.naturalWidth;
       c.height = img.naturalHeight;
@@ -399,14 +501,15 @@ export default function EditorPage(){
       ctx.clearRect(0,0,c.width,c.height);
       ctx.drawImage(img,0,0);
       try { originalImageDataRef.current = ctx.getImageData(0,0,c.width,c.height); } catch {}
+      // If we have rawMask, also ensure rawMask dimensions match? Keep it, but if new result is processed already, rawMaskRef already holds correct raw.
       const mctx = m.getContext("2d")!;
       mctx.clearRect(0,0,m.width,m.height);
       setOrigW(img.naturalWidth); setOrigH(img.naturalHeight); setResizeW(img.naturalWidth); setResizeH(img.naturalHeight);
+      renderComposite();
     };
     img.src = resultUrl;
   }, [resultUrl]);
 
-  // refine drawing handlers
   const getPos = (e: React.MouseEvent|React.TouchEvent, rect: DOMRect) => {
     const c = canvasRef.current!;
     let clientX, clientY;
@@ -455,16 +558,6 @@ export default function EditorPage(){
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     ctx.lineWidth = brushSize;
-    // erase = make transparent (destination-out), restore = draw opaque white back? We'll use compositing on mask
-    // mask: we draw with globalCompositeOperation
-    // For erase: we want to erase foreground -> we draw black on mask and later apply as eraser
-    // Simplify: mask canvas stores erase strokes as black, restore as white
-    // Actually we directly manipulate main canvas alpha via composite?
-    // Approach: mask canvas will be used as alpha mask to composite final image.
-    // We'll draw on mask: erase = black (0 alpha), restore = white (255)
-    // Initialize mask as white (we didn't fill, but treat transparent as white)
-    // So first fill mask white if empty
-    if (ctx.globalAlpha === 0) {} // noop
     ctx.globalCompositeOperation = "source-over";
     ctx.strokeStyle = brushMode === "erase" ? "rgba(0,0,0,1)" : "rgba(255,255,255,1)";
     ctx.beginPath();
@@ -480,7 +573,6 @@ export default function EditorPage(){
     if (!main || !mask || !overlay) return;
     const w = main.width, h = main.height;
     if (w===0 || h===0) return;
-    // Cap preview to 1024px max dimension for speed — full-res kept for export, preview is display only
     const maxDisplay = 1024;
     let dw=w, dh=h;
     if (Math.max(w,h) > maxDisplay){
@@ -490,7 +582,6 @@ export default function EditorPage(){
     overlay.width=dw; overlay.height=dh;
     const octx=overlay.getContext("2d")!;
     octx.clearRect(0,0,dw,dh);
-    // background at display size
     if (bgType==="color"){
       octx.fillStyle=bgColor; octx.fillRect(0,0,dw,dh);
     } else if (bgType==="image" && bgImageUrl && bgImageRef.current?.complete){
@@ -508,12 +599,10 @@ export default function EditorPage(){
         }
       }
     }
-    // main scaled to display
     const temp=document.createElement("canvas");
     temp.width=dw; temp.height=dh;
     const tctx=temp.getContext("2d")!;
     tctx.drawImage(main, 0,0,w,h, 0,0,dw,dh);
-    // mask scaled to display — per-pixel only on 1M max, not 24M full-res
     const maskScaled=document.createElement("canvas");
     maskScaled.width=dw; maskScaled.height=dh;
     const msctx=maskScaled.getContext("2d")!;
@@ -528,8 +617,8 @@ export default function EditorPage(){
           const a=mData.data[i+3];
           if(a===0) continue;
           const v=mData.data[i];
-          if(v<128) tData.data[i+3]=0; // erase
-          else tData.data[i+3]=255; // restore — opaque (isnet already feathered, no need to copy original)
+          if(v<128) tData.data[i+3]=0;
+          else tData.data[i+3]=255;
         }
         tctx.putImageData(tData,0,0);
       }
@@ -537,7 +626,6 @@ export default function EditorPage(){
     octx.drawImage(temp,0,0);
   };
 
-  // trigger composite on bg changes, brush etc
   useEffect(()=>{ renderComposite(); }, [bgType, bgColor, bgImageUrl, resultUrl, brushSize, crop]);
   useEffect(()=>{
     if (bgType==="image" && bgImageUrl){
@@ -546,7 +634,6 @@ export default function EditorPage(){
       img.src = bgImageUrl;
     }
   }, [bgImageUrl, bgType]);
-  // FIX: overlay remounts when switching tools (crop ↔ other) — re-draw so image doesn't disappear
   useEffect(()=>{
     if (resultUrl && !showBefore && !showRawMask) {
       const t = setTimeout(()=> renderComposite(), 40);
@@ -554,14 +641,12 @@ export default function EditorPage(){
     }
   }, [tool, showBefore, showRawMask, resultUrl]);
 
-  // crop preset helpers
   const setCropPreset = (preset: "free"|"1:1"|"4:5"|"16:9"|"passport") => {
     if (preset==="free") setAspect(undefined);
     else if (preset==="1:1") setAspect(1);
     else if (preset==="4:5") setAspect(4/5);
     else if (preset==="16:9") setAspect(16/9);
-    else if (preset==="passport") setAspect(35/45); // approx 3.5x4.5
-    // reset crop
+    else if (preset==="passport") setAspect(35/45);
     if (imgRef.current && preset!=="free"){
       const { width, height } = imgRef.current;
       const asp = preset==="1:1"?1: preset==="4:5"?4/5: preset==="16:9"?16/9:35/45;
@@ -572,7 +657,6 @@ export default function EditorPage(){
     }
   };
 
-  // resize handlers
   const onResizeW = (v:number) => {
     setResizeW(v);
     if (lockAspect && origW && origH) setResizeH(Math.round(v * origH / origW));
@@ -582,7 +666,6 @@ export default function EditorPage(){
     if (lockAspect && origW && origH) setResizeW(Math.round(v * origW / origH));
   };
 
-  // undo/redo
   const undo = () => {
     const m = maskCanvasRef.current;
     if (!m || history.length===0) return;
@@ -614,14 +697,12 @@ export default function EditorPage(){
     renderComposite();
   };
 
-  // Build final composition canvas (cutout + background + crop + preset) — used by both Export and Share
   const buildFinalCanvas = (): HTMLCanvasElement | null => {
     const main = canvasRef.current;
     if (!main) return null;
     const mask = maskCanvasRef.current;
     const w = main.width, h = main.height;
     if (w === 0 || h === 0) return null;
-    // 1) Build clean cutout with mask applied (transparent bg, no checker)
     const cutout = document.createElement("canvas");
     cutout.width = w; cutout.height = h;
     const cutCtx = cutout.getContext("2d")!;
@@ -647,7 +728,6 @@ export default function EditorPage(){
         }
       } catch {}
     }
-    // 2) Crop rect in source pixels (ReactCrop gives % or px relative to displayed img)
     let sx = 0, sy = 0, sw = w, sh = h;
     if (completedCrop && imgRef.current && completedCrop.width && completedCrop.height) {
       const dispW = (imgRef.current as HTMLImageElement).width || w;
@@ -655,7 +735,6 @@ export default function EditorPage(){
       if (dispW > 0 && dispH > 0) {
         const scaleX = w / dispW;
         const scaleY = h / dispH;
-        // completedCrop may be % or px — detect by unit
         const unit = (completedCrop as any).unit;
         if (unit === "%") {
           sx = Math.round(((completedCrop.x || 0) / 100) * w);
@@ -673,7 +752,6 @@ export default function EditorPage(){
       }
     }
     const hasCrop = sw !== w || sh !== h || sx !== 0 || sy !== 0;
-    // 3) Final size + draw rect
     const preset = EXPORT_PRESETS[exportPreset];
     let finalW: number, finalH: number, drawW: number, drawH: number, drawX: number, drawY: number;
     if (preset) {
@@ -684,7 +762,6 @@ export default function EditorPage(){
       drawX = Math.round((finalW - drawW) / 2);
       drawY = Math.round((finalH - drawH) / 2);
     } else {
-      // Original: if cropped, size = crop size or resizeW/H; if not cropped, size = resize or original
       if (hasCrop) {
         if (resizeW > 0 && resizeH > 0) { finalW = resizeW; finalH = resizeH; }
         else { finalW = sw; finalH = sh; }
@@ -698,7 +775,6 @@ export default function EditorPage(){
     const final = document.createElement("canvas");
     final.width = finalW; final.height = finalH;
     const fctx = final.getContext("2d")!;
-    // 4) Background at final size
     if (exportFormat === "jpg" || bgType !== "transparent") {
       if (bgType === "color") { fctx.fillStyle = bgColor; fctx.fillRect(0, 0, finalW, finalH); }
       else if (bgType === "image" && bgImageUrl && bgImageRef.current?.complete) {
@@ -708,7 +784,6 @@ export default function EditorPage(){
         fctx.drawImage(bgImg, (finalW - bw) / 2, (finalH - bh) / 2, bw, bh);
       } else if (exportFormat === "jpg") { fctx.fillStyle = "#FFFFFF"; fctx.fillRect(0, 0, finalW, finalH); }
     }
-    // 5) Draw cutout
     if (preset) {
       fctx.drawImage(cutout, sx, sy, sw, sh, drawX, drawY, drawW, drawH);
     } else {
@@ -749,7 +824,6 @@ export default function EditorPage(){
       } catch {}
     } catch(e:any){
       setError(e?.message || "Download failed — try again or use Share.");
-      // Fallback to dataUrl method
       try{
         let dataUrl: string;
         if (mime === "image/jpeg") dataUrl = final.toDataURL("image/jpeg", 0.92);
@@ -774,7 +848,6 @@ export default function EditorPage(){
       if (navigator.share && navigator.canShare?.({ files: [file] })) {
         try { await navigator.share({ files: [file], title: "Erasebg", text: "Background removed with Erasebg" }); return; } catch(e:any){ if (e?.name === "AbortError") return; }
       }
-      // Fallback to download if share not supported
       const url = URL.createObjectURL(blob);
       const a=document.createElement("a");
       a.href=url; a.download=`erasebg-${Date.now()}.${exportFormat}`;
@@ -798,7 +871,7 @@ export default function EditorPage(){
             <Uploader onFile={handleFile} />
           </div>
           <div className="mt-4 text-xs text-ink/60 dark:text-white/60 bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/20 rounded-xl p-3">
-            <strong>Tip:</strong> You can also drag & drop, or paste (Ctrl+V) from clipboard. Camera permission is optional — we’ll show a clear message if you deny it.
+            <strong>Tip:</strong> You can also drag & drop, or paste (Ctrl+V) from clipboard.
           </div>
         </div>
       </div>
@@ -807,9 +880,7 @@ export default function EditorPage(){
 
   return (
     <div className="flex-1 flex flex-col lg:flex-row min-h-[calc(100vh-64px)] max-lg:pb-[84px]">
-      {/* canvas area */}
       <div className="flex-1 flex flex-col items-center justify-start p-3 md:p-6 gap-3 bg-paper dark:bg-dark-bg dot-grid overflow-auto">
-        {/* top bar */}
         <div className="w-full max-w-[860px] flex items-center justify-between gap-2">
           <div className="flex items-center gap-2 bg-ink text-white dark:bg-white dark:text-ink rounded-full p-1">
             <button onClick={()=> { setShowBefore(true); setShowRawMask(false); }} className={`px-3.5 py-1.5 rounded-full text-xs font-medium transition-colors ${showBefore && !showRawMask ? "bg-white text-ink dark:bg-ink dark:text-white" : "text-white/80 dark:text-ink/70"}`}>Before</button>
@@ -823,13 +894,12 @@ export default function EditorPage(){
               </button>
             )}
             {hasResult && <span className="hidden md:inline-flex items-center gap-1.5 text-xs bg-violet text-white px-3 py-1.5 rounded-full font-medium"><span className="w-1.5 h-1.5 rounded-full bg-ink animate-pulse"/> Ready</span>}
-            <button onClick={()=>{ if(resultUrl?.startsWith("blob:")) try{URL.revokeObjectURL(resultUrl);}catch{}; if(currentUrl?.startsWith("blob:")) try{URL.revokeObjectURL(currentUrl);}catch{}; if(rawMaskUrl) try{ if(rawMaskUrl.startsWith("blob:")||rawMaskUrl.startsWith("data:")){} }catch{}; setCurrent(null,null); originalImageDataRef.current=null; setRawMaskUrl(null); setShowRawMask(false); }} className="text-xs px-3 py-1.5 rounded-full border border-black/10 dark:border-white/15 hover:bg-white dark:hover:bg-white/10 touch-target">New image</button>
+            <button onClick={()=>{ if(resultUrl?.startsWith("blob:")) try{URL.revokeObjectURL(resultUrl);}catch{}; if(currentUrl?.startsWith("blob:")) try{URL.revokeObjectURL(currentUrl);}catch{}; if(rawMaskUrl) try{ if(rawMaskUrl.startsWith("blob:")||rawMaskUrl.startsWith("data:")){} }catch{}; setCurrent(null,null); originalImageDataRef.current=null; rawMaskRef.current=null; setRawMaskUrl(null); setShowRawMask(false); setKeepAdjust(0); }} className="text-xs px-3 py-1.5 rounded-full border border-black/10 dark:border-white/15 hover:bg-white dark:hover:bg-white/10 touch-target">New image</button>
           </div>
         </div>
 
         <div className="w-full max-w-[860px] flex flex-col gap-3">
           <div className="relative">
-            {/* checker peeking sheet — only behind preview, never over buttons */}
             <div className="absolute inset-0 translate-x-2 translate-y-2 rounded-[20px] checker border border-zinc-200 dark:border-white/10 hidden md:block pointer-events-none" aria-hidden />
             <div className="relative rounded-[20px] overflow-hidden bg-surface dark:bg-dark-surface border border-zinc-200 dark:border-white/10 shadow-card">
 
@@ -841,10 +911,8 @@ export default function EditorPage(){
             )}
 
             <div className="relative w-full h-[420px] md:h-[560px] flex items-center justify-center bg-[#F3F3F7] dark:bg-[#1A1A28] overflow-hidden rounded-[16px]" style={{ background: showRawMask ? "#0F1020" : showBefore ? "#F3F3F7" : "#fff" }}>
-              {/* PERSISTENT offscreen canvases — keep mounted across tool switches so cutout survives */}
               <canvas ref={canvasRef} className="hidden" width={1} height={1} aria-hidden />
               <canvas ref={maskCanvasRef} className="hidden" width={1} height={1} aria-hidden />
-              {/* subtle non-covering progress — real download % only, inference shows indeterminate */}
               {processing && (
                 <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 bg-ink text-white dark:bg-white dark:text-ink px-3 py-1.5 rounded-full text-xs font-medium flex items-center gap-2 shadow-md max-w-[90%] border border-white/10">
                   <span className="w-3 h-3 border-2 border-white/30 border-t-white dark:border-ink/30 dark:border-t-ink rounded-full animate-spin shrink-0"/>
@@ -855,12 +923,11 @@ export default function EditorPage(){
               )}
               {showRawMask && rawMaskUrl ? (
                 <div className="relative w-full h-full flex items-center justify-center bg-[#0F1020] overflow-hidden">
-                  <img src={rawMaskUrl} alt="Raw mask before feather" className="w-full h-full object-contain p-2" />
-                  <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-white text-ink border border-zinc-200 px-3 py-1.5 rounded-full text-[11px] font-semibold">Raw mask — isnet — alpha, full-res, feathered</div>
-                  <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-black/70 text-white px-3 py-1 rounded-full text-[10px]">White = keep, Black = remove • Debug: before compositing</div>
+                  <img src={rawMaskUrl} alt="Raw mask" className="w-full h-full object-contain p-2" />
+                  <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-white text-ink border border-zinc-200 px-3 py-1.5 rounded-full text-[11px] font-semibold">Raw mask — white = keep</div>
+                  <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-black/70 text-white px-3 py-1 rounded-full text-[10px]">Mid-gray = low confidence • Check ghosts before fix</div>
                 </div>
               ) : showBefore ? (
-                // Before image with optional crop UI
                 tool==="crop" && hasResult ? (
                   <ReactCrop crop={crop} onChange={(_,p)=> setCrop(p)} onComplete={(c)=> setCompletedCrop(c)} aspect={aspect} className="max-w-full max-h-full">
                     <img ref={imgRef} src={currentUrl!} alt="Original" className="w-full h-full object-contain p-2" crossOrigin="anonymous" onLoad={(e)=>{
@@ -875,13 +942,11 @@ export default function EditorPage(){
                   <img src={currentUrl!} alt="Original" className="w-full h-full object-contain p-2" />
                 )
               ) : (
-                // After view
                 !hasResult ? (
                   <div className="relative w-full h-full flex items-center justify-center bg-white dark:bg-[#1A1A28]">
                     <img src={currentUrl!} alt="Original" className="w-full h-full object-contain p-2" />
                   </div>
                 ) : tool==="crop" ? (
-                  // crop also applies to result? show crop on result
                   <ReactCrop crop={crop} onChange={(_,p)=> setCrop(p)} onComplete={(c)=> setCompletedCrop(c)} aspect={aspect} className="max-w-full max-h-full">
                     <img ref={imgRef} src={resultUrl!} alt="Result" className="max-w-full max-h-[70vh] object-contain dashed-outline" style={{ background: bgType==="transparent" ? undefined : bgColor }} onLoad={(e)=>{
                       const img = e.currentTarget;
@@ -893,7 +958,6 @@ export default function EditorPage(){
                   </ReactCrop>
                 ) : (
                   <div className="relative w-full h-full flex items-center justify-center max-h-[70vh]">
-                    {/* visible overlay */}
                     <canvas
                       ref={overlayRef}
                       className={`w-full h-full object-contain p-2 ${tool==="refine" ? "cursor-crosshair" : ""}`}
@@ -906,9 +970,7 @@ export default function EditorPage(){
                       onTouchMove={handlePointerMove}
                       onTouchEnd={handlePointerUp}
                     />
-                    {/* Fallback img if canvas not yet rendered */}
                     <img src={resultUrl!} alt="" className="hidden" onLoad={()=> renderComposite()} />
-                    {/* dashed outline hint */}
                     <div className="pointer-events-none absolute inset-3 border border-dashed border-violet/40 rounded-[16px] hidden md:block" aria-hidden />
                   </div>
                 )
@@ -918,7 +980,7 @@ export default function EditorPage(){
             <div className="h-9 px-3 flex items-center justify-between text-xs border-t border-zinc-200 dark:border-white/10 bg-white/60 dark:bg-white/[0.04] backdrop-blur">
               <span className="text-ink/60 dark:text-white/60 flex items-center gap-1.5">
                 <span className={`w-2 h-2 rounded-full ${hasResult ? "bg-violet" : "bg-zinc-400"}`} />
-                {showBefore ? `${origW ? `${origW}×${origH}` : "Original"}` : hasResult ? `${origW}×${origH} • ${exportFormat.toUpperCase()}` : "Processing"}
+                {showBefore ? `${origW ? `${origW}×${origH}` : "Original"}` : hasResult ? `${origW}×${origH} • ${exportFormat.toUpperCase()} • ${mode}` : "Processing"}
               </span>
               <span className="hidden md:flex items-center gap-1 text-ink/40 dark:text-white/40">
                 {tool==="refine" && "Brush to refine edges • "}
@@ -928,7 +990,6 @@ export default function EditorPage(){
           </div>
           </div>
 
-          {/* quick actions — always above sheet */}
           <div className="flex flex-wrap gap-2 justify-center md:justify-start relative z-10">
             <button onClick={doShare} disabled={!hasResult || processing} className="bg-violet text-white px-5 py-2.5 rounded-full text-sm font-semibold hover:bg-[#5A3FE6] disabled:opacity-50 transition-colors touch-target inline-flex items-center gap-2 shadow-sm">
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 3.5V10.5M8 3.5L5 6M8 3.5L11 6M2.5 10.5V12.5C2.5 12.78 2.72 13 3 13H13C13.28 13 13.5 12.78 13.5 12.5V10.5" stroke="#0F1020" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/></svg>
@@ -938,19 +999,18 @@ export default function EditorPage(){
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 3.5V10.5M8 3.5L5 6M8 3.5L11 6M2.5 10.5V12.5C2.5 12.78 2.72 13 3 13H13C13.28 13 13.5 12.78 13.5 12.5V10.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/></svg>
               Download
             </button>
-            {hasResult && <button onClick={()=> startRemoval(currentFile!, currentUrl!)} disabled={processing} className="bg-white dark:bg-dark-surface border border-zinc-200 dark:border-white/10 px-4 py-2.5 rounded-full text-sm font-medium hover:bg-zinc-50 dark:hover:bg-white/5 touch-target disabled:opacity-50">Re-run removal</button>}
+            {hasResult && <button onClick={()=> startRemoval(currentFile!, currentUrl!, 0)} disabled={processing} className="bg-white dark:bg-dark-surface border border-zinc-200 dark:border-white/10 px-4 py-2.5 rounded-full text-sm font-medium hover:bg-zinc-50 dark:hover:bg-white/5 touch-target disabled:opacity-50">Re-run removal</button>}
+            {hasResult && <button onClick={cycleModeAndRerun} disabled={processing} className="bg-white dark:bg-dark-surface border border-violet/30 text-violet px-4 py-2.5 rounded-full text-sm font-semibold hover:bg-violet/5 touch-target disabled:opacity-50" title="Try the other model">{mode==="objects" ? "Try People mode" : mode==="people" ? "Try Objects mode" : "Try another mode"}</button>}
           </div>
         </div>
       </div>
 
-      {/* tools panel — desktop: wider, tabs well spaced, content not cramped */}
       <div className="w-full lg:w-[380px] xl:w-[400px] shrink-0 bg-surface dark:bg-dark-surface border-t lg:border-t-0 lg:border-l border-zinc-200 dark:border-white/10 flex flex-col lg:sticky lg:top-[64px] lg:h-[calc(100vh-64px)] lg:overflow-hidden">
         <div className="flex items-center justify-between px-4 lg:px-5 h-[56px] border-b border-zinc-200 dark:border-white/10 shrink-0">
           <h2 className="font-heading font-bold">Tools</h2>
           <span className="text-xs bg-violet/10 text-violet px-2.5 py-1 rounded-full font-medium">On-device</span>
         </div>
 
-        {/* tabs — desktop: even spacing, wraps on xl without horizontal scroll */}
         <div className="px-3 lg:px-3 pt-3 pb-2 flex items-center gap-1.5 overflow-x-auto lg:overflow-visible scrollbar-none border-b border-zinc-200 dark:border-white/10 shrink-0 lg:flex-wrap">
           {[
             { id:"remove", label:"Remove" },
@@ -971,6 +1031,25 @@ export default function EditorPage(){
             <div className="space-y-4">
               <h3 className="font-heading font-bold">Automatic removal</h3>
               <p className="text-sm text-ink/60 dark:text-white/60 leading-relaxed">Removes the background on your device. Usually takes 10 to 40 seconds on a phone.</p>
+              {/* Mode selector */}
+              <div className="space-y-2">
+                <p className="text-sm font-medium">Mode</p>
+                <div className="flex gap-1.5 p-1 bg-paper dark:bg-dark-bg rounded-full border border-zinc-200 dark:border-white/10">
+                  {(["auto","people","objects"] as BgMode[]).map(m=>(
+                    <button key={m} onClick={()=> setMode(m)} className={`flex-1 py-1.5 rounded-full text-xs font-semibold capitalize touch-target transition-colors ${mode===m ? "bg-ink text-white dark:bg-white dark:text-ink shadow-sm" : "text-ink/60 dark:text-white/60 hover:bg-white dark:hover:bg-white/5"}`}>{m}</button>
+                  ))}
+                </div>
+                <p className="text-[11px] leading-relaxed text-ink/50 dark:text-white/50">
+                  {mode==="people" && "People — fast, best for portraits and selfies."}
+                  {mode==="auto" && (webGPU ? "Auto — picks best for this photo." : "Auto — fast People model on this device.")}
+                  {mode==="objects" && (webGPU ? `Objects — BiRefNet lite (MIT, ${modelInfo.size}) for food, logos, multi-subject.` : `Objects — BiRefNet lite (MIT, ${modelInfo.size}). No WebGPU on this device, so it will run on CPU and can take longer.`)}
+                </p>
+                {mode==="objects" && (
+                  <div className={`text-[11px] rounded-xl p-2.5 border ${webGPU ? "bg-violet/5 border-violet/15 text-ink/70 dark:text-white/70" : "bg-amber-50 dark:bg-amber-500/10 border-amber-200 dark:border-amber-500/20 text-amber-800 dark:text-amber-200"}`}>
+                    {webGPU ? "Runs on WebGPU when available, otherwise WASM. First download ~114 MB, then cached offline." : "No WebGPU — Objects will run on CPU and can take 30–90s. Works offline after download."}
+                  </div>
+                )}
+              </div>
               {processing ? (
                 <div className="bg-violet/5 dark:bg-violet/10 rounded-2xl p-4 border border-violet/15">
                   {progressMsg?.startsWith('Downloading') && progress!==null && progress>0 ? (
@@ -995,17 +1074,24 @@ export default function EditorPage(){
               ) : hasResult ? (
                 <div className="bg-violet/10 border border-violet/20 rounded-2xl p-4 flex gap-3">
                   <div className="w-8 h-8 rounded-full bg-violet text-white flex items-center justify-center shrink-0">✓</div>
-                  <div>
+                  <div className="flex-1">
                     <p className="text-sm font-semibold">Background removed</p>
-                    <p className="text-xs text-ink/60 dark:text-white/60 mt-1">Clean isnet (WASM) — no leftover background, no cropping. No data left your device.</p>
-                    <button onClick={()=> currentFile && currentUrl && startRemoval(currentFile, currentUrl)} className="mt-2 text-xs font-semibold text-violet hover:underline">Run again</button>
+                    <p className="text-xs text-ink/60 dark:text-white/60 mt-1">No data left your device. Mode: {mode}</p>
+                    <div className="flex gap-2 mt-2">
+                      <button onClick={()=> currentFile && currentUrl && startRemoval(currentFile, currentUrl, 0)} className="text-xs font-semibold text-violet hover:underline">Run again</button>
+                      <span className="text-zinc-300">•</span>
+                      <button onClick={cycleModeAndRerun} className="text-xs font-semibold text-violet hover:underline">Try another mode</button>
+                    </div>
                   </div>
                 </div>
               ) : error ? (
                 <div className="bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/20 rounded-2xl p-4">
                   <p className="text-sm font-semibold text-red-700 dark:text-red-300">Failed • {error}</p>
-                  <p className="text-xs text-red-600 dark:text-red-300/80 mt-1 leading-relaxed">Try a smaller image, crop closer to the subject, or charge your phone — low CPU/battery slows WASM. Tap below to retry.</p>
-                  <button onClick={()=> { setError(null); hasAutoStartedRef.current=false; if(currentFile && currentUrl) startRemoval(currentFile, currentUrl); }} className="mt-3 inline-flex items-center gap-1.5 bg-red-600 text-white px-4 py-2 rounded-full text-xs font-semibold hover:bg-red-700">Try again</button>
+                  <p className="text-xs text-red-600 dark:text-red-300/80 mt-1 leading-relaxed">Try a smaller image, crop closer, or try another mode.</p>
+                  <div className="flex gap-2 mt-3">
+                    <button onClick={()=> { setError(null); hasAutoStartedRef.current=false; if(currentFile && currentUrl) startRemoval(currentFile, currentUrl, 0); }} className="inline-flex items-center gap-1.5 bg-red-600 text-white px-4 py-2 rounded-full text-xs font-semibold hover:bg-red-700">Try again</button>
+                    <button onClick={cycleModeAndRerun} className="inline-flex items-center gap-1.5 bg-white border border-red-200 text-red-700 px-4 py-2 rounded-full text-xs font-semibold hover:bg-red-50">Try another mode</button>
+                  </div>
                 </div>
               ) : (
                 <div className="rounded-2xl border-2 border-dashed border-zinc-200 dark:border-white/10 p-4 text-center">
@@ -1074,16 +1160,26 @@ export default function EditorPage(){
                 <label className="flex items-center justify-between text-sm font-medium">Brush size <span className="text-xs text-ink/50 dark:text-white/50">{brushSize}px</span></label>
                 <input type="range" min={4} max={80} value={brushSize} onChange={e=> setBrushSize(parseInt(e.target.value))} className="w-full mt-2" aria-label="Brush size" />
                 <div className="flex justify-between text-[11px] text-ink/40 dark:text-white/40 mt-1"><span>Small</span><span>Large</span></div>
+                <p className="text-[11px] text-ink/50 dark:text-white/50 mt-1">{isMobile ? "Large default for touch" : "Adjust for detail"} • {brushSize}px</p>
+              </div>
+              {/* Keep less / Keep more slider */}
+              <div className="bg-paper dark:bg-dark-bg rounded-2xl p-3.5 border border-zinc-200 dark:border-white/10 space-y-2">
+                <label className="flex items-center justify-between text-sm font-medium">Keep less / Keep more <span className="text-xs font-normal text-ink/50 dark:text-white/50">{keepAdjust>0?`+${keepAdjust}`:keepAdjust}</span></label>
+                <input type="range" min={-50} max={50} value={keepAdjust} onChange={e=> setKeepAdjust(parseInt(e.target.value))} className="w-full" aria-label="Keep less Keep more" disabled={!rawMaskRef.current} />
+                <div className="flex justify-between text-[11px] text-ink/40 dark:text-white/40"><span>Keep less</span><span>Keep more</span></div>
+                <p className="text-[11px] leading-relaxed text-ink/60 dark:text-white/60">Adjusts the mask curve without re-running the model. Below ~10% → transparent, above ~90% → opaque, smooth in between. Also removes tiny islands and fills holes. Live preview.</p>
+                {!rawMaskRef.current && <p className="text-[11px] text-amber-600 dark:text-amber-300">Run removal first to enable.</p>}
+                {rawMaskRef.current && <button onClick={()=> setKeepAdjust(0)} className="text-xs px-3 py-1 rounded-full border border-zinc-200 dark:border-white/10 hover:bg-white dark:hover:bg-white/5">Reset</button>}
               </div>
               <div className="flex gap-2">
                 <button onClick={undo} disabled={history.length===0} className="flex-1 py-2 rounded-full text-sm border border-zinc-200 dark:border-white/10 disabled:opacity-40 touch-target">Undo</button>
                 <button onClick={redo} disabled={future.length===0} className="flex-1 py-2 rounded-full text-sm border border-zinc-200 dark:border-white/10 disabled:opacity-40 touch-target">Redo</button>
                 <button onClick={clearStrokes} className="px-4 py-2 rounded-full text-sm bg-black/5 dark:bg-white/10 touch-target">Clear</button>
               </div>
-              <p className="text-xs text-ink/50 dark:text-white/50 leading-relaxed">Paint over edges to erase or restore. Works with undo/redo. Switch to After view and paint directly on the preview.</p>
+              <p className="text-xs text-ink/50 dark:text-white/50 leading-relaxed">Paint on the mask only — erase ghosts or restore faded parts. Works with undo/redo.</p>
               <div className="bg-paper dark:bg-dark-bg rounded-xl p-3 border border-zinc-200 dark:border-white/10 text-xs leading-relaxed">
                 <p className="font-medium">How it works</p>
-                <p className="text-ink/60 dark:text-white/60">Strokes are saved to a mask and composited on the canvas. You can export at any time — refinements are baked in.</p>
+                <p className="text-ink/60 dark:text-white/60">Mask edits are on a separate layer and combined at export. Use Mask view to check low-confidence mid-gray areas.</p>
               </div>
             </div>
           )}
@@ -1123,7 +1219,7 @@ export default function EditorPage(){
                   <input type="checkbox" checked={lockAspect} onChange={e=> setLockAspect(e.target.checked)} className="rounded" />
                   Lock aspect ratio
                 </label>
-                <p className="text-xs text-ink/50 dark:text-white/50">Original: {origW}×{origH} • Export will use your target size, or the preset if chosen. Large photos were downscaled to ~2000px for processing, export restores best resolution.</p>
+                <p className="text-xs text-ink/50 dark:text-white/50">Original: {origW}×{origH} • Export will use your target size, or the preset if chosen.</p>
               </div>
             </div>
           )}
@@ -1137,7 +1233,7 @@ export default function EditorPage(){
                   <button onClick={()=> setExportFormat("png")} className={`flex-1 py-2.5 rounded-full text-sm font-semibold border touch-target ${exportFormat==="png" ? "bg-ink text-white dark:bg-white dark:text-ink border-ink" : "border-zinc-200 dark:border-white/10"}`}>PNG <span className="text-xs opacity-60">Transparent</span></button>
                   <button onClick={()=> setExportFormat("jpg")} className={`flex-1 py-2.5 rounded-full text-sm font-semibold border touch-target ${exportFormat==="jpg" ? "bg-ink text-white dark:bg-white dark:text-ink border-ink" : "border-zinc-200 dark:border-white/10"}`}>JPG <span className="text-xs opacity-60">Background</span></button>
                 </div>
-                <p className="text-xs text-ink/50 dark:text-white/50 mt-1.5">PNG keeps transparency. JPG fills background (choose a color/image under Background).</p>
+                <p className="text-xs text-ink/50 dark:text-white/50 mt-1.5">PNG keeps transparency. JPG fills background.</p>
               </div>
 
               <div>
@@ -1157,13 +1253,13 @@ export default function EditorPage(){
                 Download {exportFormat.toUpperCase()} {exportPreset!=="Original" ? `• ${exportPreset}` : ""}
               </button>
               <button onClick={doShare} disabled={!hasResult} className="w-full bg-ink text-white dark:bg-white dark:text-ink py-3 rounded-full font-semibold hover:bg-black disabled:opacity-50 touch-target">Share (mobile) — falls back to download</button>
-              <p className="text-xs text-ink/50 dark:text-white/50 text-center">Recent images are saved automatically to your device (IndexedDB). Clear them in Settings.</p>
+              <p className="text-xs text-ink/50 dark:text-white/50 text-center">Recent images are saved automatically to your device.</p>
             </div>
           )}
         </div>
 
         <div className="p-3 border-t border-zinc-200 dark:border-white/10 hidden lg:block">
-          <p className="text-[11px] text-ink/40 dark:text-white/40 leading-relaxed">All processing on-device • No accounts • No backend • Your photos never leave this device.</p>
+          <p className="text-[11px] text-ink/40 dark:text-white/40 leading-relaxed">All processing on-device • No accounts • Your photos never leave this device.</p>
         </div>
       </div>
     </div>
